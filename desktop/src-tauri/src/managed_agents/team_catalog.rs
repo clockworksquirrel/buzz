@@ -24,7 +24,7 @@ use buzz_core_pkg::kind::KIND_TEAM_CATALOG;
 use nostr::{EventBuilder, Kind, Tag};
 use serde::{Deserialize, Serialize};
 
-use super::{persona_events::persona_d_tag, AgentDefinition, RespondTo, TeamRecord};
+use super::{AgentDefinition, RespondTo, TeamRecord};
 
 /// Schema version of the 30178 content body. A reader that does not recognize
 /// the value must refuse the event rather than guess at its shape.
@@ -64,6 +64,17 @@ pub const MAX_NAME_POOL_ENTRIES: usize = 64;
 /// check cannot turn an accepted projection into a rejected event.
 pub const MAX_TOTAL_BYTES: usize = 192 * 1024;
 
+/// Maximum bytes for a member's opaque `member_key`. A conforming key is a
+/// 64-char SHA-256 hex digest; the bound is the parse-side ceiling for a
+/// foreign publisher's value, which need only be opaque and unique.
+pub const MAX_MEMBER_KEY_BYTES: usize = 128;
+/// Maximum bytes for a member's runtime, model, or provider identifier.
+pub const MAX_IDENTIFIER_BYTES: usize = 256;
+/// Maximum bytes for a built-in reuse slug.
+pub const MAX_BUILTIN_SLUG_BYTES: usize = 128;
+/// Length of a hex-encoded SHA-256 projection hash.
+pub const PROJECTION_HASH_HEX_LEN: usize = 64;
+
 /// The JSON body stored in a kind:30178 event's content field.
 ///
 /// Field order is pinned by the struct declaration: serde emits in declaration
@@ -97,15 +108,17 @@ pub struct TeamCatalogMember {
     /// Stable, opaque identity of this member WITHIN this team publication.
     ///
     /// Provenance for an added member is the triple `(owner_pubkey,
-    /// team_d_tag, member_key)`. The value is derived from the source
-    /// persona's normalized d-tag so that rebuilding an unchanged team
-    /// reproduces identical bytes — a random key would make every reconcile
-    /// pass see a hash mismatch and republish forever.
+    /// team_d_tag, member_key)`, so the key must distinguish every member the
+    /// publisher can hold. It is a domain-separated SHA-256 over the source
+    /// record's `id` — see [`member_key_for`]. Hashing an already-unique id is
+    /// deterministic, so an unchanged team rebuilds to identical bytes, while
+    /// the published value discloses no local id.
     ///
     /// A recipient MUST treat it as opaque and MUST NOT resolve it as a
     /// kind:30175 coordinate in the publisher's namespace: the publisher may
     /// never have shared that persona individually, and a member that is
-    /// present here is not thereby readable there.
+    /// present here is not thereby readable there. Hashing makes that misuse
+    /// structurally impossible rather than merely forbidden.
     pub member_key: String,
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,10 +199,35 @@ fn sanitized_respond_to(record: &AgentDefinition) -> Option<String> {
     }
 }
 
+/// The opaque published identity of one member.
+///
+/// Derived from the source record's `id`, which is unique within the
+/// publisher's persona store — a UUID for in-app personas, `builtin:<slug>`
+/// for built-ins, the pack slug for pack-installed records. The id is hashed
+/// with a domain-separation prefix rather than published raw, so the key
+/// leaks no local identifier and cannot be mistaken for a resolvable
+/// kind:30175 d-tag.
+///
+/// Deliberately NOT `persona_events::persona_d_tag`: that normalizer is
+/// documented non-injective — it case-folds, maps every char outside `[a-z0-9_-]` to
+/// `-`, and truncates to 64 bytes — so two distinct members could publish one
+/// key. Provenance is keyed on `(owner_pubkey, team_d_tag, member_key)`, so a
+/// collision there is not cosmetic: on adoption the second colliding member
+/// matches the first copy's provenance and both published members collapse
+/// onto a single local persona. SHA-256 over the exact id keeps distinct
+/// sources distinct.
+pub fn member_key_for(record: &AgentDefinition) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"buzz:team-catalog:member-key:v1\0");
+    hasher.update(record.id.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// Project one member definition, without the built-in reuse hint.
 fn member_projection(record: &AgentDefinition) -> TeamCatalogMember {
     TeamCatalogMember {
-        member_key: persona_d_tag(record),
+        member_key: member_key_for(record),
         display_name: record.display_name.clone(),
         // Mirrors `persona_event_content`: always `Some`, including for an
         // empty prompt, so the encoding does not depend on emptiness.
@@ -206,6 +244,26 @@ fn member_projection(record: &AgentDefinition) -> TeamCatalogMember {
     }
 }
 
+/// The canonical catalog slug of a local built-in, or `None` for any record
+/// that is not one.
+///
+/// Real built-ins are constructed with ids like `builtin:fizz` and
+/// `source_team_persona_slug: None` (`managed_agents::personas`), so keying
+/// the reuse hint on `source_team_persona_slug` matched no real built-in on
+/// either side — the publisher emitted no hint and the recipient could find
+/// no local candidate. The `builtin:` id prefix is the actual canonical
+/// identity, and it is identical across installs, which is exactly what a
+/// cross-install reuse hint needs.
+pub fn builtin_catalog_slug(record: &AgentDefinition) -> Option<&str> {
+    if !record.is_builtin {
+        return None;
+    }
+    record
+        .id
+        .strip_prefix("builtin:")
+        .filter(|slug| !slug.is_empty())
+}
+
 /// Project a member and attach the built-in reuse hint when applicable.
 ///
 /// The hash is computed over the member projection with both hint fields
@@ -215,11 +273,9 @@ fn member_projection(record: &AgentDefinition) -> TeamCatalogMember {
 /// never match across installs.
 fn member_projection_with_reuse_hint(record: &AgentDefinition) -> TeamCatalogMember {
     let mut member = member_projection(record);
-    if record.is_builtin {
-        if let Some(slug) = record.source_team_persona_slug.clone() {
-            member.projection_hash = Some(member_projection_hash(&member));
-            member.builtin_slug = Some(slug);
-        }
+    if let Some(slug) = builtin_catalog_slug(record) {
+        member.projection_hash = Some(member_projection_hash(&member));
+        member.builtin_slug = Some(slug.to_string());
     }
     member
 }
@@ -261,8 +317,28 @@ fn bounded(value: &str, max: usize, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn non_empty(value: &str, label: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("invalid team projection: {label} is empty"));
+    }
+    Ok(())
+}
+
+/// Validate one member against the v1 contract.
+///
+/// Every field a recipient will persist is checked here, because adoption
+/// copies the projection into a local `AgentDefinition` verbatim. A field that
+/// is bounded on the way in but unvalidated on the way out produces a record
+/// that is accepted at add time and only fails later when the agent is minted
+/// — `parallelism` was exactly that: a publisher could send `999`, adoption
+/// stored it, and minting rejected it out of 1..=32 at launch. Validating at
+/// the parse boundary makes an unusable team un-addable instead of
+/// add-then-broken.
 fn validate_member(member: &TeamCatalogMember) -> Result<(), String> {
     let who = &member.display_name;
+    non_empty(&member.member_key, "a member key")?;
+    bounded(&member.member_key, MAX_MEMBER_KEY_BYTES, "a member key")?;
+    non_empty(&member.display_name, "a member display name")?;
     bounded(
         &member.display_name,
         MAX_NAME_BYTES,
@@ -282,6 +358,20 @@ fn validate_member(member: &TeamCatalogMember) -> Result<(), String> {
             &format!("the avatar for '{who}'"),
         )?;
     }
+    for (value, label) in [
+        (&member.runtime, "runtime"),
+        (&member.model, "model"),
+        (&member.provider, "provider"),
+    ] {
+        if let Some(value) = value {
+            non_empty(value, &format!("the {label} for '{who}'"))?;
+            bounded(
+                value,
+                MAX_IDENTIFIER_BYTES,
+                &format!("the {label} for '{who}'"),
+            )?;
+        }
+    }
     if member.name_pool.len() > MAX_NAME_POOL_ENTRIES {
         return Err(format!(
             "team too large to share: '{who}' has {} name-pool entries (limit {MAX_NAME_POOL_ENTRIES})",
@@ -289,11 +379,53 @@ fn validate_member(member: &TeamCatalogMember) -> Result<(), String> {
         ));
     }
     for name in &member.name_pool {
+        non_empty(name, &format!("a name-pool entry for '{who}'"))?;
         bounded(
             name,
             MAX_NAME_BYTES,
             &format!("a name-pool entry for '{who}'"),
         )?;
+    }
+    // Rejected at the boundary rather than on use: an unrecognized mode must
+    // not become a local definition whose audience differs from what the
+    // recipient was shown.
+    if let Some(mode) = &member.respond_to {
+        RespondTo::parse_wire(mode)?;
+    }
+    // Mirrors the 1..=32 range `mint_behavioral_defaults` enforces, so a team
+    // whose members could never launch is refused at add time.
+    if let Some(parallelism) = member.parallelism {
+        if !(1..=32).contains(&parallelism) {
+            return Err(format!(
+                "invalid team projection: parallelism {parallelism} for '{who}' is out of range (must be between 1 and 32)"
+            ));
+        }
+    }
+    // The reuse hint is only meaningful as a complete, well-formed pair. A
+    // half-pair or a malformed hash is a broken publisher, not a hostile one
+    // the hash comparison would absorb — refuse it rather than silently
+    // ignoring the hint.
+    match (&member.builtin_slug, &member.projection_hash) {
+        (Some(slug), Some(hash)) => {
+            non_empty(slug, &format!("the built-in slug for '{who}'"))?;
+            bounded(
+                slug,
+                MAX_BUILTIN_SLUG_BYTES,
+                &format!("the built-in slug for '{who}'"),
+            )?;
+            if hash.len() != PROJECTION_HASH_HEX_LEN || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "invalid team projection: the reuse hash for '{who}' is not a SHA-256 hex digest"
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(format!(
+                "invalid team projection: '{who}' has an incomplete built-in reuse hint"
+            ))
+        }
     }
     Ok(())
 }
@@ -318,8 +450,21 @@ pub fn validate_team_catalog_content(content: &TeamCatalogContent) -> Result<(),
             content.members.len()
         ));
     }
+    // Provenance for every adopted member is `(owner_pubkey, team_d_tag,
+    // member_key)`. Two members sharing a key would resolve to one provenance
+    // and collapse onto a single local persona at adoption, silently dropping
+    // a member the recipient was shown. Rejecting the publication is the only
+    // safe answer: there is no way to tell which of the two the recipient
+    // meant to keep.
+    let mut seen = std::collections::HashSet::with_capacity(content.members.len());
     for member in &content.members {
         validate_member(member)?;
+        if !seen.insert(member.member_key.as_str()) {
+            return Err(format!(
+                "invalid team projection: '{}' repeats the member key '{}' of an earlier member",
+                member.display_name, member.member_key
+            ));
+        }
     }
     let encoded = team_catalog_content_json(content)?;
     if encoded.len() > MAX_TOTAL_BYTES {

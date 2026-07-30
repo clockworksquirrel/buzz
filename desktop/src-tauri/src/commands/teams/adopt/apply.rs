@@ -16,7 +16,10 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         load_personas, load_teams, save_personas, save_teams,
-        team_catalog::{local_member_projection_hash, TeamCatalogContent, TeamCatalogMember},
+        team_catalog::{
+            builtin_catalog_slug, local_member_projection_hash, TeamCatalogContent,
+            TeamCatalogMember,
+        },
         try_regenerate_nest, AgentDefinition, RespondTo, TeamCatalogSource,
         TeamMemberCatalogSource, TeamRecord,
     },
@@ -170,8 +173,8 @@ fn resolve_member(
 
 /// A local built-in that is byte-identical to the published member.
 ///
-/// Substitution requires BOTH the slug to exist locally AND the local
-/// built-in's current projection hash to equal the published
+/// Substitution requires BOTH the canonical `builtin:<slug>` to exist locally
+/// AND the local built-in's current projection hash to equal the published
 /// `projection_hash`. The hash is what makes the hint exact-match gated: a
 /// hostile `builtin_slug` paired with unrelated embedded fields, a retired
 /// slug, and a slug whose local definition has since changed all fail the
@@ -183,8 +186,7 @@ fn reusable_builtin(personas: &[AgentDefinition], member: &TeamCatalogMember) ->
     personas
         .iter()
         .find(|persona| {
-            persona.is_builtin
-                && persona.source_team_persona_slug.as_deref() == Some(slug)
+            builtin_catalog_slug(persona) == Some(slug)
                 && local_member_projection_hash(persona) == published_hash
         })
         .map(|persona| persona.id.clone())

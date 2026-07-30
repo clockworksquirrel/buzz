@@ -197,16 +197,27 @@ fn test_editing_a_member_definition_changes_the_team_bytes() {
 
 // ── Built-in reuse hint (exact-hash gated) ──────────────────────────────────
 
+/// A REAL built-in record, as `ensure_built_in_personas` installs it: id
+/// `builtin:<slug>`, `source_team_persona_slug: None`. The reuse hint keys off
+/// the canonical id, so a synthetic slug fixture would test a path no install
+/// can reach.
+///
+/// The avatar is cleared because every live built-in ships a ~170-190 KiB
+/// inline PNG data URL, far past `MAX_AVATAR_URL_BYTES` — a separate defect
+/// from the identity derivation under test here.
+fn builtin_record(id: &str) -> AgentDefinition {
+    let mut record = crate::managed_agents::built_in_persona_definition(id, "2026-07-30T00:00:00Z")
+        .unwrap_or_else(|| panic!("'{id}' is not a built-in persona"));
+    record.avatar_url = None;
+    record
+}
+
 #[test]
 fn test_builtin_member_carries_slug_and_projection_hash() {
-    let mut builtin = member("m1", "One");
-    builtin.is_builtin = true;
-    builtin.source_team_persona_slug = Some("reviewer".to_string());
-
-    let content = build_team_catalog_content(&team(), &[builtin]).unwrap();
+    let content = build_team_catalog_content(&team(), &[builtin_record("builtin:fizz")]).unwrap();
     let projected = &content.members[0];
 
-    assert_eq!(projected.builtin_slug.as_deref(), Some("reviewer"));
+    assert_eq!(projected.builtin_slug.as_deref(), Some("fizz"));
     assert!(projected.projection_hash.is_some());
 }
 
@@ -219,12 +230,23 @@ fn test_non_builtin_member_carries_no_reuse_hint() {
 }
 
 #[test]
+fn test_a_record_flagged_builtin_without_the_canonical_id_carries_no_hint() {
+    // `is_builtin` alone is not the identity: a pack-installed or adopted copy
+    // can carry the flag, and there is no cross-install slug to reuse it by.
+    let mut impostor = member("m1", "One");
+    impostor.is_builtin = true;
+
+    let content = build_team_catalog_content(&team(), &[impostor]).unwrap();
+
+    assert_eq!(content.members[0].builtin_slug, None);
+    assert_eq!(content.members[0].projection_hash, None);
+}
+
+#[test]
 fn test_reuse_hash_changes_when_the_builtin_definition_changes() {
     // Same slug, different definition — the recipient must be able to detect
     // it and fall back rather than substituting a mismatched local built-in.
-    let mut original = member("m1", "One");
-    original.is_builtin = true;
-    original.source_team_persona_slug = Some("reviewer".to_string());
+    let original = builtin_record("builtin:fizz");
     let mut changed = original.clone();
     changed.system_prompt = "Review differently.".to_string();
 
@@ -242,11 +264,15 @@ fn test_reuse_hash_changes_when_the_builtin_definition_changes() {
 fn test_reuse_hash_excludes_the_hint_fields_so_a_recipient_can_recompute_it() {
     // The recipient hashes its OWN local built-in, which knows nothing about
     // the publisher's slug. A self-referential hash could never match.
-    let mut builtin = member("m1", "One");
-    builtin.is_builtin = true;
-    builtin.source_team_persona_slug = Some("reviewer".to_string());
+    let builtin = builtin_record("builtin:fizz");
+    let recomputed = local_member_projection_hash(&builtin);
     let content = build_team_catalog_content(&team(), &[builtin]).unwrap();
     let projected = &content.members[0];
+
+    assert_eq!(
+        projected.projection_hash.as_deref(),
+        Some(recomputed.as_str())
+    );
 
     let mut hint_free = projected.clone();
     hint_free.builtin_slug = None;
@@ -491,6 +517,205 @@ fn test_member_key_is_stable_for_an_unchanged_member() {
 
     assert_eq!(a.members[0].member_key, b.members[0].member_key);
     assert!(!a.members[0].member_key.is_empty());
+}
+
+#[test]
+fn test_member_key_follows_the_member_across_a_reorder() {
+    // Provenance is `(owner_pubkey, team_d_tag, member_key)`. A key derived
+    // from position would re-point every copy at a different published member
+    // on any membership reorder.
+    let forward =
+        build_team_catalog_content(&team(), &[member("m1", "One"), member("m2", "Two")]).unwrap();
+    let reversed =
+        build_team_catalog_content(&team(), &[member("m2", "Two"), member("m1", "One")]).unwrap();
+
+    assert_eq!(
+        forward.members[0].member_key,
+        reversed.members[1].member_key
+    );
+    assert_eq!(
+        forward.members[1].member_key,
+        reversed.members[0].member_key
+    );
+}
+
+#[test]
+fn test_two_members_with_identical_content_still_get_distinct_keys() {
+    // Everything but the local id matches, which is exactly the shape the old
+    // display-name-derived key collapsed.
+    let mut twin = member("m2", "One");
+    twin.system_prompt = member("m1", "One").system_prompt.clone();
+
+    let content = build_team_catalog_content(&team(), &[member("m1", "One"), twin]).unwrap();
+
+    assert_ne!(content.members[0].member_key, content.members[1].member_key);
+}
+
+#[test]
+fn test_ids_that_persona_d_tag_would_collapse_get_distinct_keys() {
+    use crate::managed_agents::persona_events::persona_d_tag;
+
+    // `persona_d_tag` case-folds, maps every char outside `[a-z0-9_-]` to
+    // `-`, and truncates at 64 bytes. Each pair below is one d-tag and two
+    // members; the key derivation must keep them apart.
+    let long = "x".repeat(64);
+    for (left, right) in [
+        ("Reviewer".to_string(), "reviewer".to_string()),
+        ("a b".to_string(), "a.b".to_string()),
+        (format!("{long}1"), format!("{long}2")),
+    ] {
+        let (one, two) = (member(&left, "One"), member(&right, "Two"));
+        assert_eq!(
+            persona_d_tag(&one),
+            persona_d_tag(&two),
+            "fixture must actually collide under the d-tag normalizer"
+        );
+
+        let content = build_team_catalog_content(&team(), &[one, two]).unwrap();
+
+        assert_ne!(
+            content.members[0].member_key, content.members[1].member_key,
+            "'{left}' and '{right}' must not share a published identity"
+        );
+    }
+}
+
+#[test]
+fn test_member_key_does_not_disclose_the_local_id() {
+    let content = build_team_catalog_content(&team(), &[member("secret-local-id", "One")]).unwrap();
+
+    assert!(!team_catalog_content_json(&content)
+        .unwrap()
+        .contains("secret-local-id"));
+    assert_eq!(
+        content.members[0].member_key.len(),
+        PROJECTION_HASH_HEX_LEN,
+        "a SHA-256 hex digest"
+    );
+}
+
+#[test]
+fn test_a_body_repeating_a_member_key_is_rejected_on_read() {
+    // Two members on one key resolve to one provenance triple and collapse
+    // onto a single local persona at adoption, silently dropping a member the
+    // recipient was shown.
+    let event = signed_event_with_content(
+        r#"{"v":1,"name":"Twins","members":[
+            {"member_key":"k","display_name":"One"},
+            {"member_key":"k","display_name":"Two"}
+        ]}"#,
+    );
+
+    let error = team_catalog_content_from_event(&event).unwrap_err();
+
+    assert!(error.contains("repeats the member key"), "{error}");
+    assert!(
+        error.contains("Two"),
+        "the error names the offender: {error}"
+    );
+}
+
+// ── v1 validation contract (parse boundary) ─────────────────────────────────
+
+/// A body carrying one member built from `fields`, as JSON.
+fn body_with_member(fields: &str) -> nostr::Event {
+    signed_event_with_content(&format!(
+        r#"{{"v":1,"name":"T","members":[{{"member_key":"k","display_name":"One",{fields}}}]}}"#
+    ))
+}
+
+#[test]
+fn test_members_violating_the_v1_contract_are_rejected_on_read() {
+    for (label, fields) in [
+        (
+            "out-of-range parallelism",
+            r#""parallelism":999"#.to_string(),
+        ),
+        ("zero parallelism", r#""parallelism":0"#.to_string()),
+        (
+            "unknown respond_to mode",
+            r#""respond_to":"everyone""#.to_string(),
+        ),
+        ("empty runtime", r#""runtime":"""#.to_string()),
+        (
+            "oversize model",
+            format!(r#""model":"{}""#, "m".repeat(MAX_IDENTIFIER_BYTES + 1)),
+        ),
+        ("empty name-pool entry", r#""name_pool":[""]"#.to_string()),
+        (
+            "reuse slug with no hash",
+            r#""builtin_slug":"reviewer""#.to_string(),
+        ),
+        (
+            "reuse hash with no slug",
+            format!(r#""projection_hash":"{}""#, "a".repeat(64)),
+        ),
+        (
+            "malformed reuse hash",
+            r#""builtin_slug":"reviewer","projection_hash":"nope""#.to_string(),
+        ),
+        (
+            "non-hex reuse hash",
+            format!(
+                r#""builtin_slug":"reviewer","projection_hash":"{}""#,
+                "z".repeat(64)
+            ),
+        ),
+    ] {
+        assert!(
+            team_catalog_content_from_event(&body_with_member(&fields)).is_err(),
+            "{label} must be refused at the parse boundary"
+        );
+    }
+}
+
+#[test]
+fn test_members_at_the_edges_of_the_v1_contract_are_accepted() {
+    for (label, fields) in [
+        ("minimum parallelism", r#""parallelism":1"#.to_string()),
+        ("maximum parallelism", r#""parallelism":32"#.to_string()),
+        (
+            "well-formed reuse hint",
+            format!(
+                r#""builtin_slug":"reviewer","projection_hash":"{}""#,
+                "A".repeat(64)
+            ),
+        ),
+        (
+            "identifier at the limit",
+            format!(r#""model":"{}""#, "m".repeat(MAX_IDENTIFIER_BYTES)),
+        ),
+    ] {
+        assert!(
+            team_catalog_content_from_event(&body_with_member(&fields)).is_ok(),
+            "{label} is within the contract and must be accepted"
+        );
+    }
+}
+
+#[test]
+fn test_a_member_with_an_empty_key_or_name_is_rejected_on_read() {
+    for members in [
+        r#"{"member_key":"","display_name":"One"}"#,
+        r#"{"member_key":"k","display_name":"  "}"#,
+    ] {
+        let event =
+            signed_event_with_content(&format!(r#"{{"v":1,"name":"T","members":[{members}]}}"#));
+        assert!(
+            team_catalog_content_from_event(&event).is_err(),
+            "{members}"
+        );
+    }
+}
+
+#[test]
+fn test_an_oversize_member_key_is_rejected_on_read() {
+    let event = signed_event_with_content(&format!(
+        r#"{{"v":1,"name":"T","members":[{{"member_key":"{}","display_name":"One"}}]}}"#,
+        "k".repeat(MAX_MEMBER_KEY_BYTES + 1)
+    ));
+
+    assert!(team_catalog_content_from_event(&event).is_err());
 }
 
 // ── Tombstone ───────────────────────────────────────────────────────────────
