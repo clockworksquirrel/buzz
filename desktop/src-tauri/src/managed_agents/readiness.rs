@@ -1718,7 +1718,6 @@ mod tests {
             key: "OPENROUTER_API_KEY".to_string()
         }));
     }
-
     #[test]
     fn buzz_agent_openrouter_with_provider_model_fallback_is_ready() {
         let env = make_env(

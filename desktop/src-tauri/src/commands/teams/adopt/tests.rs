@@ -728,7 +728,6 @@ fn test_delete_then_re_add_reactivates_copies() {
     let owner = "a".repeat(64);
     let src = source(&owner);
     let body = content(vec![member("mk1", "Do it.")]);
-    const NOW: &str = "2026-01-01T00:00:00Z";
 
     // Step 1: initial add
     let initial = plan(&[], &[], &src, &body).stores.unwrap();

@@ -325,7 +325,7 @@ pub fn delete_team_with_cascade(app: &AppHandle, team_id: &str) -> Result<Vec<St
 ///
 /// Extracted so the deactivation logic is testable without an AppHandle.
 pub(crate) fn deactivate_catalog_member_copies(
-    personas: &mut Vec<super::AgentDefinition>,
+    personas: &mut [super::AgentDefinition],
     owner_pubkey: &str,
     team_d_tag: &str,
 ) -> bool {

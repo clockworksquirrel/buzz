@@ -8,7 +8,7 @@ use super::{
     merge_teams_impl, sort_teams, validate_team_deletion, BuiltInTeam,
 };
 use crate::managed_agents::{
-    AgentDefinition, ManagedAgentRecord, TeamCatalogSource, TeamMemberCatalogSource, TeamRecord,
+    AgentDefinition, ManagedAgentRecord, TeamMemberCatalogSource, TeamRecord,
 };
 
 fn team(id: &str, name: &str) -> TeamRecord {

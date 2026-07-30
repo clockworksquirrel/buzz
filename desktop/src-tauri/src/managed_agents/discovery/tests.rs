@@ -1773,7 +1773,6 @@ fn harness_def(
         install_hint: String::new(),
     }
 }
-
 /// A `save_and_warm` landing mid-discovery (after the scan, before the
 /// publish) must survive discovery's registry publish — through the real
 /// `discover_acp_runtimes_from` path.
@@ -1807,7 +1806,6 @@ fn discovery_publish_path_survives_mid_flight_save() {
          publish clobbers a save that landed mid-discovery"
     );
 }
-
 /// A `delete_and_warm` landing mid-discovery must stay gone after discovery's
 /// publish — a stale snapshot (taken while the file existed) would resurrect it.
 #[test]

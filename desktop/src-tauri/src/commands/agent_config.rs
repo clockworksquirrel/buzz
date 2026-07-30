@@ -998,7 +998,6 @@ mod tests {
         assert_eq!(entries[0].value, "databricks_v2");
         assert!(!entries[0].masked);
     }
-
     #[test]
     fn baked_env_api_key_is_masked() {
         let entries = baked_env_from_map(&[("ANTHROPIC_API_KEY", "sk-secret")]);
@@ -1006,7 +1005,6 @@ mod tests {
         assert_eq!(entries[0].value, "••••••");
         assert!(entries[0].masked);
     }
-
     #[test]
     fn baked_env_token_key_is_masked() {
         let entries = baked_env_from_map(&[("GITHUB_TOKEN", "ghp_secret")]);

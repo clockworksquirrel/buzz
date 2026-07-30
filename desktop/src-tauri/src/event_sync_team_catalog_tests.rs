@@ -285,7 +285,7 @@ fn test_deleted_team_with_shared_head_is_tombstoned_at_reconcile() {
     let base = tempfile::tempdir().unwrap();
     let keys = nostr::Keys::generate();
     retain_head(base.path(), &keys, &team(), &[member("m1", "Original.")]);
-    assert!(head(base.path(), &keys).unwrap().pending_sync == false);
+    assert!(!head(base.path(), &keys).unwrap().pending_sync);
 
     // Simulate the team having been deleted: write empty stores, as if the
     // team record was removed before the tombstone helper ran.

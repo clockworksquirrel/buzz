@@ -1306,12 +1306,10 @@ fn restart_eligible_false_when_orphan_has_hash_drift() {
 fn restart_eligible_false_when_orphan_has_availability_drift() {
     assert!(!super::restart_eligible(true, false, true));
 }
-
 #[test]
 fn restart_eligible_false_when_orphan_has_no_drift() {
     assert!(!super::restart_eligible(true, false, false));
 }
-
 #[test]
 fn restart_eligible_false_when_non_orphan_has_no_drift() {
     assert!(!super::restart_eligible(false, false, false));
