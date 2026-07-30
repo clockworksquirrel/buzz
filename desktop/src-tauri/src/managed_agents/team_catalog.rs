@@ -579,5 +579,49 @@ pub fn build_team_catalog_delete(
     Ok(EventBuilder::new(Kind::Custom(5), "").tags(vec![tag]))
 }
 
+/// Purge the retained 30178 head at `d_tag` and enqueue a kind:5 tombstone.
+///
+/// Called from two contexts that both hold the db path and keys but cannot
+/// both reach `commands::teams::pending::tombstone_team_catalog_at`:
+/// - `commands::teams::pending` (direct delete_team path)
+/// - `event_sync` (boot reconcile for orphaned shared heads, F1)
+///
+/// Splitting the shared logic here avoids a cross-module layering violation
+/// while keeping the two callers in agreement about what a tombstone is.
+pub fn tombstone_team_catalog_coordinate(
+    db_path: &std::path::Path,
+    keys: &nostr::Keys,
+    d_tag: &str,
+) -> Result<(), String> {
+    use crate::managed_agents::retention::{
+        delete_retained_event, open_retention_db, retain_event, tombstone_retention_d_tag,
+        RetainedEvent,
+    };
+    use nostr::JsonUtil;
+
+    const KIND_DELETE: u32 = 5;
+
+    let pubkey = keys.public_key().to_hex();
+    let event = build_team_catalog_delete(d_tag, &pubkey)?
+        .sign_with_keys(keys)
+        .map_err(|e| format!("failed to sign team catalog tombstone: {e}"))?;
+    let conn = open_retention_db(db_path)?;
+    delete_retained_event(&conn, KIND_TEAM_CATALOG, &pubkey, d_tag)?;
+    retain_event(
+        &conn,
+        &RetainedEvent {
+            kind: KIND_DELETE,
+            pubkey,
+            // Key by the target coordinate so the 30176 and 30178
+            // tombstones for one team occupy distinct rows.
+            d_tag: tombstone_retention_d_tag(KIND_TEAM_CATALOG, d_tag),
+            content: event.content.to_string(),
+            created_at: event.created_at.as_secs() as i64,
+            raw_event: event.as_json(),
+            pending_sync: true,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests;

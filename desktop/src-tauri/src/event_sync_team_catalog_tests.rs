@@ -274,3 +274,46 @@ fn test_builtin_teams_are_skipped() {
 
     assert_eq!(reconcile(base.path(), &keys).unwrap(), 0);
 }
+
+#[test]
+fn test_deleted_team_with_shared_head_is_tombstoned_at_reconcile() {
+    // F1: a team is deleted after it was shared. `delete_team` is best-effort
+    // for the tombstone; a crash there (or any failure) leaves the shared head
+    // visible indefinitely until the next boot reconcile. The reconcile must
+    // see the orphaned head via the retained-coordinate worklist and tombstone
+    // it — it cannot rely on the team still existing in the store.
+    let base = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    retain_head(base.path(), &keys, &team(), &[member("m1", "Original.")]);
+    assert!(head(base.path(), &keys).unwrap().pending_sync == false);
+
+    // Simulate the team having been deleted: write empty stores, as if the
+    // team record was removed before the tombstone helper ran.
+    write_stores(base.path(), &[], &[]);
+
+    assert_eq!(reconcile(base.path(), &keys).unwrap(), 1);
+
+    // The 30178 coordinate is gone from the retention store (tombstone_team_catalog_at
+    // purges it and enqueues a kind:5 in its place). Verify the head is absent.
+    assert!(
+        head(base.path(), &keys).is_none(),
+        "the orphaned shared head must be purged from the retention store"
+    );
+}
+
+#[test]
+fn test_deleted_team_tombstone_is_not_repeated_on_next_boot() {
+    // After the first boot tombstones the orphaned head (purging the 30178
+    // row), the next boot must see no 30178 heads and do nothing.
+    let base = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    retain_head(base.path(), &keys, &team(), &[member("m1", "Original.")]);
+    write_stores(base.path(), &[], &[]);
+    reconcile(base.path(), &keys).unwrap();
+
+    assert_eq!(
+        reconcile(base.path(), &keys).unwrap(),
+        0,
+        "no 30178 head remains, so nothing to tombstone"
+    );
+}

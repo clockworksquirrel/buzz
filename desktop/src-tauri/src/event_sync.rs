@@ -364,38 +364,74 @@ fn reconcile_team_catalog_heads_at(
 ) -> Result<u32, String> {
     use crate::managed_agents::{
         persona_events::monotonic_created_at,
-        retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
+        retention::{get_retained_events_by_kind, open_retention_db, retain_event, RetainedEvent},
         team_catalog::{
             build_team_catalog_event, build_team_catalog_retraction, resolve_team_members,
+            tombstone_team_catalog_coordinate,
         },
         TeamRecord,
     };
     use buzz_core_pkg::kind::{event_is_shared, KIND_TEAM_CATALOG};
     use nostr::JsonUtil;
 
-    let teams: Vec<TeamRecord> = read_json_store(&base_dir.join("teams.json"))?;
-    if teams.is_empty() {
-        return Ok(0);
-    }
-    let personas = read_persona_definitions(base_dir)?;
-
     let pubkey = keys.public_key().to_hex();
     let conn =
         open_retention_db(db_path).map_err(|e| format!("failed to open retention db: {e}"))?;
+
+    // Enumerate retained 30178 heads as the authoritative worklist. A team
+    // that was deleted after a shared head was written is still visible here;
+    // iterating only the current team store would miss the orphan entirely.
+    let all_heads = get_retained_events_by_kind(&conn, KIND_TEAM_CATALOG, &pubkey)?;
+    if all_heads.is_empty() {
+        return Ok(0);
+    }
+
+    // Load teams once; missing is equivalent to empty (owner cleared the
+    // store). Load personas only when at least one shared head is found.
+    let teams: Vec<TeamRecord> = read_json_store(&base_dir.join("teams.json"))?;
+    let personas = read_persona_definitions(base_dir)?;
+
     let mut reconciled = 0u32;
 
-    for team in &teams {
-        // A built-in team can never have been shared, so it can never have a
-        // head to correct.
-        if team.is_builtin {
+    for head in &all_heads {
+        let head_event = nostr::Event::from_json(&head.raw_event).map_err(|e| {
+            format!(
+                "failed to parse retained head for d-tag '{}': {e}",
+                head.d_tag
+            )
+        })?;
+
+        // Only shared heads represent live community-visible state. An
+        // already-unshared head cannot be made worse by leaving it; a
+        // tombstone covers deletion of the whole coordinate (delete_team).
+        if !event_is_shared(&head_event) {
             continue;
         }
-        let Some(head) = get_retained_event(&conn, KIND_TEAM_CATALOG, &pubkey, &team.id)? else {
+
+        // F1: the corresponding team no longer exists → the owner deleted it
+        // after it was shared. Tombstone the coordinate now so the community
+        // catalog stops showing it. This is the case the team-first loop
+        // could never see.
+        let Some(team) = teams.iter().find(|t| t.id == head.d_tag) else {
+            eprintln!(
+                "buzz-desktop: team-catalog-reconcile: tombstoning '{}' — team no longer exists",
+                head.d_tag
+            );
+            // best-effort: a failure here is logged and skipped; the next
+            // boot will retry via the same worklist.
+            if let Err(e) = tombstone_team_catalog_coordinate(db_path, keys, &head.d_tag) {
+                eprintln!(
+                    "buzz-desktop: team-catalog-reconcile: tombstone failed for '{}': {e}",
+                    head.d_tag
+                );
+            } else {
+                reconciled += 1;
+            }
             continue;
         };
-        let head_event = nostr::Event::from_json(&head.raw_event)
-            .map_err(|e| format!("failed to parse retained head for '{}': {e}", team.name))?;
-        if !event_is_shared(&head_event) {
+
+        // Built-in teams can never have been shared, but be defensive.
+        if team.is_builtin {
             continue;
         }
 

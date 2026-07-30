@@ -196,36 +196,7 @@ pub(super) fn tombstone_team_catalog_at(
     keys: &nostr::Keys,
     d_tag: &str,
 ) -> Result<(), String> {
-    use crate::managed_agents::{
-        retention::{
-            delete_retained_event, open_retention_db, retain_event, tombstone_retention_d_tag,
-        },
-        team_catalog::build_team_catalog_delete,
-    };
-    use nostr::JsonUtil;
-
-    const KIND_DELETE: u32 = 5;
-
-    let pubkey = keys.public_key().to_hex();
-    let event = build_team_catalog_delete(d_tag, &pubkey)?
-        .sign_with_keys(keys)
-        .map_err(|e| format!("failed to sign team catalog tombstone: {e}"))?;
-    let conn = open_retention_db(db_path)?;
-    delete_retained_event(&conn, KIND_TEAM_CATALOG, &pubkey, d_tag)?;
-    retain_event(
-        &conn,
-        &RetainedEvent {
-            kind: KIND_DELETE,
-            pubkey,
-            // Key by the target coordinate so the 30176 and 30178
-            // tombstones for one team occupy distinct rows (F2c).
-            d_tag: tombstone_retention_d_tag(KIND_TEAM_CATALOG, d_tag),
-            content: event.content.to_string(),
-            created_at: event.created_at.as_secs() as i64,
-            raw_event: event.as_json(),
-            pending_sync: true,
-        },
-    )
+    crate::managed_agents::team_catalog::tombstone_team_catalog_coordinate(db_path, keys, d_tag)
 }
 
 #[cfg(test)]
