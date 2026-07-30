@@ -1,5 +1,5 @@
 //! `add_team_from_catalog`: copy another owner's published team into the local
-//! stores, atomically.
+//! stores with byte-level rollback on error.
 //!
 //! Two properties define this command, and both are amendment requirements:
 //!
@@ -11,10 +11,12 @@
 //! fallback: adding from a coordinate we cannot read is exactly the case where
 //! a retracted or superseded team would be copied.
 //!
-//! **The write is all-or-nothing.** Both stores are snapshotted under the
-//! store lock and restored wholesale on any failure, so a partial add can
-//! never leave orphan member copies behind or a reactivated copy stranded in
-//! the active list.
+//! **The write uses byte-level rollback.** Both stores are snapshotted (raw
+//! bytes) under the store lock before any write. If either save fails, both
+//! files are restored from their snapshots. A crash between the two writes
+//! leaves the stores inconsistent; retry is the recovery path (the add is
+//! idempotent: an orphaned team is found by the replay check, and orphaned
+//! member copies are reused by provenance matching).
 //!
 //! Everything about the projection itself — the schema, the size contract,
 //! the member shape — is `managed_agents::team_catalog`'s; this module only

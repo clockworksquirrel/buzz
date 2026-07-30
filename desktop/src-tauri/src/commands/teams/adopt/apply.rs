@@ -1,13 +1,23 @@
 //! The store-mutation half of `add_team_from_catalog`: turn a verified
-//! projection into local records, all-or-nothing.
+//! projection into local records with byte-level rollback on error.
 //!
-//! The whole mutation is computed in memory by [`plan_add`] before anything is
-//! written, so no failure in resolving members can leave a half-added team on
-//! disk. Only the two saves themselves remain, and the first succeeding while
-//! the second fails is covered by restoring both snapshots wholesale — a total
-//! rollback rather than a best-effort undo of the rows we remember touching,
-//! which matters for a member copy that was reactivated rather than created
-//! and whose "undo" is a field revert with no row to delete.
+//! [`plan_add`] computes both stores in memory before anything is written, so
+//! no failure in resolving members can leave a half-added team on disk. Only
+//! the two saves themselves remain. Before either write we snapshot the raw
+//! bytes of both files (or record their absence). When either save fails we
+//! restore both snapshots, replacing the on-disk content exactly as it was —
+//! including for a reactivated member copy where logical undo would require a
+//! field revert with no row to delete.
+//!
+//! **Crash window.** A process kill between the first commit and the second
+//! (or between the second and a successful restore) leaves the stores
+//! inconsistent. On restart the team either exists without some member copies,
+//! or the member copies exist without the team. The next add of the same
+//! publication is idempotent: the replay check in `plan_add` finds the team
+//! (if present) and returns it; any orphaned copies are reused by provenance
+//! matching. Users who encounter a crash mid-add should retry the add.
+
+use std::path::Path;
 
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
@@ -15,12 +25,13 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     managed_agents::{
-        load_personas, load_teams, save_personas, save_teams,
+        atomic_write_json_restricted, load_personas, load_teams, managed_agents_store_path,
+        save_personas, save_teams,
         team_catalog::{
             builtin_catalog_slug, local_member_projection_hash, TeamCatalogContent,
             TeamCatalogMember,
         },
-        try_regenerate_nest, AgentDefinition, RespondTo, TeamCatalogSource,
+        teams_store_path, try_regenerate_nest, AgentDefinition, RespondTo, TeamCatalogSource,
         TeamMemberCatalogSource, TeamRecord,
     },
     util::now_iso,
@@ -37,6 +48,67 @@ pub(super) struct AddPlan {
     pub team: TeamRecord,
 }
 
+/// Raw bytes of a file before the add, or `None` if the file did not exist.
+///
+/// Used to restore both stores to their exact pre-add state when either save
+/// fails. Restoring the managed-agents store from bytes is the only way to
+/// undo a reactivation (flipping `is_active` from `false` to `true`) without
+/// re-reading the file and re-applying the mutation in reverse.
+type RawSnapshot = Option<Vec<u8>>;
+
+/// Read the raw bytes of `path`, or `None` if the file does not yet exist.
+fn snapshot(path: &Path) -> Result<RawSnapshot, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("failed to snapshot {}: {e}", path.display())),
+    }
+}
+
+/// Restore `path` from a snapshot taken by [`snapshot`].
+///
+/// `None` means the file was absent before the add; remove it so the on-disk
+/// state matches. A restore failure is not masked — it is returned alongside
+/// the original cause that triggered the rollback.
+fn restore(path: &Path, snap: RawSnapshot) -> Result<(), String> {
+    match snap {
+        Some(bytes) => atomic_write_json_restricted(path, &bytes),
+        None => std::fs::remove_file(path)
+            .map_err(|e| format!("failed to remove {} during restore: {e}", path.display())),
+    }
+}
+
+/// Write both stores with byte-level rollback on failure.
+///
+/// Takes the file paths and write callbacks as arguments so the logic is
+/// testable with temporary files and injected-failure writers without needing
+/// a Tauri `AppHandle`.
+///
+/// On any write error: restore both files from the pre-call snapshots. A
+/// restore failure is surfaced alongside the original error, not masked.
+pub(super) fn commit_stores(
+    personas_path: &Path,
+    teams_path: &Path,
+    write_personas: impl FnOnce() -> Result<(), String>,
+    write_teams: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let personas_snap = snapshot(personas_path)?;
+    let teams_snap = snapshot(teams_path)?;
+
+    if let Err(error) = write_personas().and_then(|()| write_teams()) {
+        let restore_result =
+            restore(personas_path, personas_snap).and_then(|()| restore(teams_path, teams_snap));
+        if let Err(restore_error) = restore_result {
+            return Err(format!(
+                "{error} (and the local stores could not be restored: {restore_error})"
+            ));
+        }
+        return Err(error);
+    }
+
+    Ok(())
+}
+
 pub(super) fn add_verified_team(
     app: &AppHandle,
     source: &TeamCatalogSource,
@@ -51,6 +123,9 @@ pub(super) fn add_verified_team(
         .lock()
         .map_err(|error| error.to_string())?;
 
+    let personas_path = managed_agents_store_path(app)?;
+    let teams_path = teams_store_path(app)?;
+
     let personas_before = load_personas(app)?;
     let teams_before = load_teams(app)?;
     let plan = plan_add(&personas_before, &teams_before, source, content, &now_iso())?;
@@ -62,20 +137,16 @@ pub(super) fn add_verified_team(
         });
     };
 
-    if let Err(error) = save_personas(app, &personas).and_then(|()| save_teams(app, &teams)) {
-        // `save_teams` can only have run after `save_personas` succeeded, so
-        // restoring both unconditionally covers every partial state. A restore
-        // that itself fails is surfaced with the original cause attached
-        // rather than masking it.
-        if let Err(restore_error) =
-            save_personas(app, &personas_before).and_then(|()| save_teams(app, &teams_before))
-        {
-            return Err(format!(
-                "{error} (and the local stores could not be restored: {restore_error})"
-            ));
-        }
-        return Err(error);
-    }
+    // Snapshot raw bytes before either write. If either save fails, we restore
+    // both files to exactly their pre-add state. Using raw bytes rather than
+    // re-serializing the before-vectors ensures the restore is byte-exact even
+    // for a reactivated member copy whose logical undo is a field revert.
+    commit_stores(
+        &personas_path,
+        &teams_path,
+        || save_personas(app, &personas),
+        || save_teams(app, &teams),
+    )?;
 
     try_regenerate_nest(app);
     Ok(AddTeamFromCatalogResult {

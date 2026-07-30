@@ -2,8 +2,9 @@
 //! backend accepts as a catalog head (A2), and what it writes locally (A1).
 //!
 //! Neither half needs a Tauri app or a relay: `verified_head_content` takes a
-//! signed event, and `plan_add` computes both stores in memory. The only piece
-//! not covered here is the pair of `save_*` calls between them.
+//! signed event, and `plan_add` computes both stores in memory. The write path
+//! (`commit_stores`) is covered separately in the `commit_stores_tests` module
+//! using temporary files and injected-failure callbacks.
 
 use super::apply::plan_add;
 use super::{normalized_event_id, verified_head_content};
@@ -711,4 +712,160 @@ fn test_provenance_survives_a_store_round_trip() {
 
 fn clone_provenance(value: &TeamMemberCatalogSource) -> TeamMemberCatalogSource {
     value.clone()
+}
+
+// ── commit_stores: byte-level rollback coverage ───────────────────────────
+
+mod commit_stores_tests {
+    use super::super::apply::commit_stores;
+    use std::fs;
+
+    fn write_file(path: &std::path::Path, contents: &[u8]) {
+        // Use a plain fs::write for test files — no special permissions needed.
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn test_both_writes_succeed_leaves_new_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let personas = dir.path().join("personas.json");
+        let teams = dir.path().join("teams.json");
+        write_file(&personas, b"old-personas");
+        write_file(&teams, b"old-teams");
+
+        let result = commit_stores(
+            &personas,
+            &teams,
+            || {
+                fs::write(&personas, b"new-personas").map_err(|e| e.to_string())?;
+                Ok(())
+            },
+            || {
+                fs::write(&teams, b"new-teams").map_err(|e| e.to_string())?;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(fs::read(&personas).unwrap(), b"new-personas");
+        assert_eq!(fs::read(&teams).unwrap(), b"new-teams");
+    }
+
+    #[test]
+    fn test_first_write_fails_both_files_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let personas = dir.path().join("personas.json");
+        let teams = dir.path().join("teams.json");
+        write_file(&personas, b"original-personas");
+        write_file(&teams, b"original-teams");
+
+        let result = commit_stores(
+            &personas,
+            &teams,
+            || Err("personas save failed".to_string()),
+            || unreachable!("teams write should not run if personas failed"),
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("personas save failed"));
+        // Both files are restored to their original content.
+        assert_eq!(fs::read(&personas).unwrap(), b"original-personas");
+        assert_eq!(fs::read(&teams).unwrap(), b"original-teams");
+    }
+
+    #[test]
+    fn test_second_write_fails_after_first_committed_both_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let personas = dir.path().join("personas.json");
+        let teams = dir.path().join("teams.json");
+        write_file(&personas, b"original-personas");
+        write_file(&teams, b"original-teams");
+
+        let result = commit_stores(
+            &personas,
+            &teams,
+            || {
+                // First write succeeds — personas is now changed on disk.
+                fs::write(&personas, b"new-personas").map_err(|e| e.to_string())?;
+                Ok(())
+            },
+            || Err("teams save failed".to_string()),
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("teams save failed"));
+        // The personas file is restored despite having been written.
+        assert_eq!(fs::read(&personas).unwrap(), b"original-personas");
+        assert_eq!(fs::read(&teams).unwrap(), b"original-teams");
+    }
+
+    #[test]
+    fn test_absent_file_is_removed_on_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let personas = dir.path().join("personas.json");
+        let teams = dir.path().join("teams.json");
+        // Neither file exists before the add.
+
+        let result = commit_stores(
+            &personas,
+            &teams,
+            || {
+                // Personas write creates the file.
+                fs::write(&personas, b"new-personas").map_err(|e| e.to_string())?;
+                Ok(())
+            },
+            || Err("teams save failed".to_string()),
+        );
+
+        assert!(result.is_err());
+        // Personas was created by the first write but must be cleaned up on rollback.
+        assert!(
+            !personas.exists(),
+            "newly created file should be removed on rollback"
+        );
+        assert!(!teams.exists());
+    }
+
+    #[test]
+    fn test_restore_failure_message_includes_both_errors() {
+        // When restore fails, the message includes both the original error and
+        // the restore error so neither is silently swallowed.
+        //
+        // We trigger a restore failure by placing the "file" at a path whose
+        // parent directory we remove after snapshotting — atomic_write_json_restricted
+        // cannot create the .tmp file after the parent is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let personas = sub.join("personas.json");
+        let teams = sub.join("teams.json");
+        write_file(&personas, b"snap-p");
+        write_file(&teams, b"snap-t");
+
+        // Remove the sub-directory after the snapshot is taken (inside the callback).
+        let sub_clone = sub.clone();
+        let result = commit_stores(
+            &personas,
+            &teams,
+            || {
+                // Obliterate the directory so the restore path below cannot write,
+                // then return an explicit error. The remove_dir_all failure would
+                // mask our error string, so we ignore its result.
+                let _ = std::fs::remove_dir_all(&sub_clone);
+                Err("original error".to_string())
+            },
+            || unreachable!(),
+        );
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("original error"),
+            "missing original error in: {msg}"
+        );
+        assert!(
+            msg.contains("could not be restored"),
+            "missing restore-failure note in: {msg}"
+        );
+    }
 }
