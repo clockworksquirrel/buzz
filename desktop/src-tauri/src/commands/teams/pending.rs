@@ -199,5 +199,87 @@ pub(super) fn tombstone_team_catalog_at(
     crate::managed_agents::team_catalog::tombstone_team_catalog_coordinate(db_path, keys, d_tag)
 }
 
+/// Refresh the shared 30178 head for `team` after a successful team edit.
+///
+/// Inbound reconcile and workspace-apply are excluded by the caller holding
+/// the store lock; this only fires from explicit owner-local mutations. The
+/// updated `members` slice must already reflect the just-saved state.
+/// Best-effort: a failure is logged rather than surfaced, so a retention
+/// hiccup never blocks a team rename or membership change from returning.
+pub(super) fn refresh_shared_team_catalog_head(
+    app: &AppHandle,
+    state: &AppState,
+    team: &TeamRecord,
+    members: &[AgentDefinition],
+) {
+    let result = prepare_team_publication(app, state, team, members, None).map(|_| ());
+    if let Err(e) = result {
+        eprintln!("buzz-desktop: team-catalog-refresh: '{}' — {e}", team.name);
+    }
+}
+
+/// Refresh or retract the shared 30178 heads of every team that includes
+/// `persona_id` as a member, after a successful persona edit.
+///
+/// A persona edit changes every catalog projection it is part of. Walking all
+/// teams is the only way to find them without an inverse index. Best-effort.
+pub(super) fn refresh_shared_team_catalog_heads_for_persona(
+    app: &AppHandle,
+    state: &AppState,
+    persona_id: &str,
+) {
+    let result = (|| -> Result<(), String> {
+        use crate::managed_agents::{load_personas, load_teams};
+
+        let teams = load_teams(app)?;
+        let personas = load_personas(app)?;
+        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+
+        for team in &teams {
+            if team.is_builtin || !team.persona_ids.iter().any(|id| id == persona_id) {
+                continue;
+            }
+            // Only act if the team has a shared head — checking before
+            // projecting avoids spurious retain calls for unshared teams.
+            use crate::managed_agents::retention::{get_retained_event, open_retention_db};
+            use buzz_core_pkg::kind::{event_is_shared, KIND_TEAM_CATALOG};
+            use nostr::JsonUtil;
+
+            let conn = open_retention_db(&scope.db_path)?;
+            let Some(existing) = get_retained_event(
+                &conn,
+                KIND_TEAM_CATALOG,
+                &scope.owner_keys.public_key().to_hex(),
+                &team.id,
+            )?
+            else {
+                continue;
+            };
+            let head_event = nostr::Event::from_json(&existing.raw_event)
+                .map_err(|e| format!("failed to parse retained head: {e}"))?;
+            if !event_is_shared(&head_event) {
+                continue;
+            }
+
+            if let Err(e) = prepare_team_publication_at(
+                &scope.db_path,
+                &scope.owner_keys,
+                team,
+                &personas,
+                None,
+            ) {
+                eprintln!(
+                    "buzz-desktop: team-catalog-refresh: '{}' after persona edit — {e}",
+                    team.name
+                );
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        eprintln!("buzz-desktop: team-catalog-refresh-for-persona: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests;

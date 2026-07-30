@@ -31,6 +31,20 @@ mod sharing;
 pub use adopt::add_team_from_catalog;
 pub use sharing::set_team_shared;
 
+/// Refresh the shared 30178 catalog heads of every team that includes
+/// `persona_id` as a member, after a successful persona edit.
+///
+/// Exposed as `pub(crate)` so persona-edit commands can trigger a catalog
+/// refresh without crossing into the `commands::teams` private module.
+/// Best-effort: failures are logged, not returned.
+pub(crate) fn refresh_team_catalog_heads_for_persona(
+    app: &AppHandle,
+    state: &AppState,
+    persona_id: &str,
+) {
+    pending::refresh_shared_team_catalog_heads_for_persona(app, state, persona_id);
+}
+
 /// Retain a freshly authored team event in the local store, flagged for relay
 /// sync. Called inside a command's `managed_agents_store_lock`-held body after
 /// `save_teams`; the background flush loop publishes it out-of-band.
@@ -226,6 +240,16 @@ pub async fn update_team(input: UpdateTeamRequest, app: AppHandle) -> Result<Tea
         // Built-in teams are not owner-authored — never publish them.
         if !updated.is_builtin {
             retain_team_pending(&app, &state, &updated);
+            // F2: if this team has a shared 30178 head, reproject it now
+            // so the catalog reflects the edit immediately rather than
+            // waiting for the next workspace apply or restart. Best-effort
+            // (failures logged, not surfaced) so a retention hiccup never
+            // blocks the team rename from returning.
+            if let Ok(members) =
+                crate::managed_agents::team_catalog::resolve_team_members(&updated, &personas)
+            {
+                pending::refresh_shared_team_catalog_head(&app, &state, &updated, &members);
+            }
         }
         Ok(updated)
     })
