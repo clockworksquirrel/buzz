@@ -9,10 +9,14 @@ export const teamCatalogCopy = {
   addingAction: "Adding…",
   shareTitle: "Share to catalog",
   shareDescription:
-    "Anyone in this community can find and add a copy of this team. Every member’s instruction is shared as plaintext. Memories and secrets aren’t included.",
+    "Anyone in this community can find and add a copy of this team. Every member's instruction is shared as plaintext. Memories and secrets aren't included.",
   shareAriaLabel: "What to share in the catalog",
   notSharedOption: "Not shared",
   sharedOption: "Shared",
+  invalidMemberSingular:
+    "1 member in this team could not be verified and cannot be added.",
+  invalidMemberPlural: (count: number) =>
+    `${count} members in this team could not be verified and cannot be added.`,
 } as const;
 
 /**

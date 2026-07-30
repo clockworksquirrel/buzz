@@ -59,6 +59,7 @@ export function TeamCatalogDialog({
   }, [open, teams]);
 
   const isSelectedTeamAdded = selectedTeam?.localTeam != null;
+  const isSelectedTeamInvalid = (selectedTeam?.invalidMemberCount ?? 0) > 0;
 
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
@@ -84,8 +85,10 @@ export function TeamCatalogDialog({
           isAdding={isAdding}
           isLoading={isLoading}
           isSelectedTeamAdded={isSelectedTeamAdded}
+          isSelectedTeamInvalid={isSelectedTeamInvalid}
           onAddTeam={() => {
-            if (selectedTeam && !isSelectedTeamAdded) onAddTeam(selectedTeam);
+            if (selectedTeam && !isSelectedTeamAdded && !isSelectedTeamInvalid)
+              onAddTeam(selectedTeam);
           }}
           onSelectTeam={setSelectedKey}
           selectedKey={selectedTeam ? catalogTeamKey(selectedTeam) : null}
@@ -102,6 +105,7 @@ type TeamCatalogChooserProps = {
   isAdding: boolean;
   isLoading: boolean;
   isSelectedTeamAdded: boolean;
+  isSelectedTeamInvalid: boolean;
   onAddTeam: () => void;
   onSelectTeam: (key: string) => void;
   selectedKey: string | null;
@@ -114,6 +118,7 @@ function TeamCatalogChooser({
   isAdding,
   isLoading,
   isSelectedTeamAdded,
+  isSelectedTeamInvalid,
   onAddTeam,
   onSelectTeam,
   selectedKey,
@@ -203,6 +208,18 @@ function TeamCatalogChooser({
               {error.message}
             </p>
           ) : null}
+          {selectedTeam && isSelectedTeamInvalid ? (
+            <p
+              className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+              data-testid="team-catalog-invalid-member-warning"
+            >
+              {selectedTeam.invalidMemberCount === 1
+                ? teamCatalogCopy.invalidMemberSingular
+                : teamCatalogCopy.invalidMemberPlural(
+                    selectedTeam.invalidMemberCount,
+                  )}
+            </p>
+          ) : null}
         </div>
 
         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-end bg-gradient-to-t from-background via-background/95 to-transparent px-5 pb-4 pt-12">
@@ -210,13 +227,20 @@ function TeamCatalogChooser({
             aria-label={
               selectedTeam && isSelectedTeamAdded
                 ? `${selectedTeam.name} is already in your teams`
-                : selectedTeam
-                  ? `Add ${selectedTeam.name} from Team Catalog`
-                  : undefined
+                : selectedTeam && isSelectedTeamInvalid
+                  ? `${selectedTeam.name} cannot be added because it contains invalid members`
+                  : selectedTeam
+                    ? `Add ${selectedTeam.name} from Team Catalog`
+                    : undefined
             }
             className="pointer-events-auto"
             data-testid="team-catalog-add-team"
-            disabled={!selectedTeam || isSelectedTeamAdded || isAdding}
+            disabled={
+              !selectedTeam ||
+              isSelectedTeamAdded ||
+              isAdding ||
+              isSelectedTeamInvalid
+            }
             onClick={onAddTeam}
             size="sm"
             type="button"

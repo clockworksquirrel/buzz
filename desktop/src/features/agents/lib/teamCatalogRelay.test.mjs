@@ -6,8 +6,10 @@ import { emojiAvatarDataUrl } from "@/features/profile/ui/ProfileAvatarEditor.ut
 import {
   catalogTeamsFromPublications,
   fetchTeamCatalogPublications,
+  parseTeamCatalogContent,
   teamCatalogPublicationsFromEvents,
 } from "./teamCatalogRelay.ts";
+import { teamCatalogCopy } from "../ui/teamLibraryCopy.ts";
 
 const ALICE = "a".repeat(64);
 const BOB = "b".repeat(64);
@@ -172,25 +174,32 @@ test("test_unknown_schema_version_is_rejected_rather_than_best_effort_parsed", (
   );
 });
 
-// A team shown with a member missing is a different team than the one its
-// owner published, so a single bad member fails the whole projection.
-test("test_one_unparsable_member_drops_the_whole_team", () => {
+// Invalid members are counted, not dropped: a team with invalid members is
+// shown with a diagnostic and the Add button disabled, so the user can see
+// what is wrong without losing visibility of the team.
+test("test_one_invalid_member_key_counts_as_invalid_not_drop", () => {
   const publications = teamCatalogPublicationsFromEvents([
     teamEvent({
       members: [member(), member({ member_key: "", display_name: "Nameless" })],
     }),
   ]);
 
-  assert.deepEqual(publications, []);
+  assert.equal(publications.length, 1, "team is still shown");
+  assert.equal(
+    publications[0].invalidMemberCount,
+    1,
+    "one invalid member counted",
+  );
+  assert.equal(publications[0].members.length, 1, "only valid member rendered");
 });
 
-test("test_member_missing_a_display_name_drops_the_whole_team", () => {
-  assert.deepEqual(
-    teamCatalogPublicationsFromEvents([
-      teamEvent({ members: [member({ display_name: "   " })] }),
-    ]),
-    [],
-  );
+test("test_member_missing_a_display_name_counts_as_invalid_not_drop", () => {
+  const publications = teamCatalogPublicationsFromEvents([
+    teamEvent({ members: [member({ display_name: "   " })] }),
+  ]);
+  assert.equal(publications.length, 1, "team is still shown");
+  assert.equal(publications[0].invalidMemberCount, 1);
+  assert.equal(publications[0].members.length, 0);
 });
 
 test("test_a_team_with_no_members_is_still_a_valid_projection", () => {
@@ -391,4 +400,167 @@ test("test_short_first_team_page_does_not_issue_a_second_request", async (t) => 
 
   assert.equal(filters.length, 1);
   assert.equal(publications.length, 2);
+});
+
+// ── parseTeamCatalogContent: v1 validation contract ───────────────────────
+
+function contentEvent(body) {
+  return {
+    id: "evt1",
+    pubkey: ALICE,
+    created_at: 1,
+    kind: 30178,
+    tags: [
+      ["d", "squad"],
+      ["shared", "true"],
+    ],
+    content: JSON.stringify(body),
+    sig: "sig",
+  };
+}
+
+function validBody(memberOverrides = {}) {
+  return {
+    v: 1,
+    name: "Review Squad",
+    members: [
+      {
+        member_key: "mk1",
+        display_name: "Agent One",
+        system_prompt: "Do it.",
+        ...memberOverrides,
+      },
+    ],
+  };
+}
+
+test("test_valid_body_yields_zero_invalid_members", () => {
+  const result = parseTeamCatalogContent(contentEvent(validBody()));
+  assert.ok(result !== null);
+  assert.equal(result.invalidMemberCount, 0);
+  assert.equal(result.members.length, 1);
+});
+
+test("test_wrong_schema_version_returns_null", () => {
+  const result = parseTeamCatalogContent(
+    contentEvent({ ...validBody(), v: 2 }),
+  );
+  assert.equal(result, null);
+});
+
+test("test_member_count_cap_exceeded_returns_null", () => {
+  const manyMembers = Array.from({ length: 65 }, (_, i) => ({
+    member_key: `k${i}`,
+    display_name: `Agent ${i}`,
+  }));
+  const result = parseTeamCatalogContent(
+    contentEvent({ v: 1, name: "Big Team", members: manyMembers }),
+  );
+  assert.equal(result, null);
+});
+
+test("test_member_with_parallelism_out_of_range_counts_as_invalid", () => {
+  const result = parseTeamCatalogContent(
+    contentEvent(validBody({ parallelism: 999 })),
+  );
+  assert.ok(result !== null);
+  assert.equal(result.invalidMemberCount, 1, "parallelism 999 fails v1");
+  assert.equal(result.members.length, 0, "invalid member is not rendered");
+});
+
+test("test_parallelism_at_boundary_values_is_valid", () => {
+  const r1 = parseTeamCatalogContent(
+    contentEvent(validBody({ parallelism: 1 })),
+  );
+  assert.equal(r1?.invalidMemberCount, 0);
+  const r32 = parseTeamCatalogContent(
+    contentEvent(validBody({ parallelism: 32 })),
+  );
+  assert.equal(r32?.invalidMemberCount, 0);
+});
+
+test("test_member_with_unrecognized_respond_to_counts_as_invalid", () => {
+  const result = parseTeamCatalogContent(
+    contentEvent(validBody({ respond_to: "nobody" })),
+  );
+  assert.ok(result !== null);
+  assert.equal(result.invalidMemberCount, 1, "unknown respond_to fails v1");
+});
+
+test("test_recognized_respond_to_values_are_valid", () => {
+  for (const mode of ["all", "anyone", "allowlist", "owner_only"]) {
+    const r = parseTeamCatalogContent(
+      contentEvent(validBody({ respond_to: mode })),
+    );
+    assert.equal(
+      r?.invalidMemberCount,
+      0,
+      `respond_to '${mode}' should be valid`,
+    );
+  }
+});
+
+test("test_member_missing_member_key_counts_as_invalid", () => {
+  const result = parseTeamCatalogContent(
+    contentEvent({ v: 1, name: "T", members: [{ display_name: "A" }] }),
+  );
+  assert.ok(result !== null);
+  assert.equal(result.invalidMemberCount, 1);
+});
+
+test("test_partial_builtin_hint_counts_as_invalid", () => {
+  // builtin_slug present but projection_hash absent
+  const result = parseTeamCatalogContent(
+    contentEvent(validBody({ builtin_slug: "fizz" })),
+  );
+  assert.ok(result !== null);
+  assert.equal(result.invalidMemberCount, 1, "half-pair hint must fail");
+});
+
+test("test_complete_builtin_hint_with_valid_sha256_is_valid", () => {
+  const hash = "a".repeat(64);
+  const result = parseTeamCatalogContent(
+    contentEvent(validBody({ builtin_slug: "fizz", projection_hash: hash })),
+  );
+  assert.ok(result !== null);
+  assert.equal(
+    result.invalidMemberCount,
+    0,
+    "complete hint with 64-char hex hash is valid",
+  );
+});
+
+test("test_multiple_invalid_members_accumulate_count", () => {
+  const body = {
+    v: 1,
+    name: "Mixed Team",
+    members: [
+      { member_key: "k1", display_name: "Good", system_prompt: "OK" },
+      { member_key: "k2", display_name: "Bad", parallelism: 0 },
+      { member_key: "k3", display_name: "Also Bad", respond_to: "???" },
+    ],
+  };
+  const result = parseTeamCatalogContent(contentEvent(body));
+  assert.ok(result !== null);
+  assert.equal(result.invalidMemberCount, 2, "two invalid members");
+  assert.equal(result.members.length, 1, "one valid member rendered");
+  assert.equal(result.members[0].displayName, "Good");
+});
+
+test("test_name_too_long_returns_null", () => {
+  const longName = "x".repeat(300); // 300 > 256 byte limit
+  const result = parseTeamCatalogContent(
+    contentEvent({ v: 1, name: longName, members: [] }),
+  );
+  assert.equal(result, null, "oversize name must return null");
+});
+
+test("test_description_too_long_returns_null", () => {
+  const body = {
+    v: 1,
+    name: "T",
+    description: "x".repeat(5000), // > 4*1024
+    members: [],
+  };
+  assert.equal(parseTeamCatalogContent(contentEvent(body)), null);
 });

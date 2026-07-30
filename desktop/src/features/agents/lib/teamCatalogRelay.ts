@@ -24,6 +24,29 @@ import { KIND_TEAM_CATALOG } from "@/shared/constants/kinds";
 /** Schema version this client understands. Must match the backend's. */
 const TEAM_CATALOG_SCHEMA_VERSION = 1;
 
+// ── v1 size bounds — must stay in sync with team_catalog.rs ──────────────
+const MAX_MEMBERS = 64;
+const MAX_NAME_BYTES = 256;
+const MAX_TEXT_BYTES = 4 * 1024;
+const MAX_SYSTEM_PROMPT_BYTES = 16 * 1024;
+const MAX_AVATAR_URL_BYTES = 32 * 1024;
+const MAX_NAME_POOL_ENTRIES = 64;
+const MAX_TOTAL_BYTES = 192 * 1024;
+const MAX_MEMBER_KEY_BYTES = 128;
+const MAX_IDENTIFIER_BYTES = 256;
+const MAX_BUILTIN_SLUG_BYTES = 128;
+
+/** Recognized respond_to wire values. Must stay in sync with RespondTo::parse_wire. */
+const RESPOND_TO_VALUES = new Set(["all", "anyone", "allowlist", "owner_only"]);
+
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+function withinBytes(value: string, max: number): boolean {
+  return byteLength(value) <= max;
+}
+
 export type CatalogTeamMember = {
   memberKey: string;
   displayName: string;
@@ -44,6 +67,12 @@ export type CatalogTeam = {
   description: string | null;
   instructions: string | null;
   members: CatalogTeamMember[];
+  /**
+   * Number of members that failed v1 validation. When non-zero the team is
+   * displayed with a diagnostic and the Add button is disabled — a team with
+   * invalid members cannot be safely adopted.
+   */
+  invalidMemberCount: number;
   /** The local team already copied from this publication, if any. */
   localTeam: AgentTeam | null;
 };
@@ -56,9 +85,116 @@ function optionalString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
-function parseMember(value: unknown): CatalogTeamMember | null {
+/**
+ * Validate one member against the v1 contract. Returns true when the member
+ * passes all checks, false when any bound is exceeded or a recognized value
+ * is unrecognized. Mirrors validate_member in team_catalog.rs.
+ */
+function memberPassesV1(value: unknown): boolean {
+  if (!isObject(value)) return false;
+
+  // Required: non-empty member_key within bounds
   if (
-    !isObject(value) ||
+    typeof value.member_key !== "string" ||
+    value.member_key.trim().length === 0 ||
+    !withinBytes(value.member_key, MAX_MEMBER_KEY_BYTES)
+  ) {
+    return false;
+  }
+
+  // Required: non-empty display_name within bounds
+  if (
+    typeof value.display_name !== "string" ||
+    value.display_name.trim().length === 0 ||
+    !withinBytes(value.display_name, MAX_NAME_BYTES)
+  ) {
+    return false;
+  }
+
+  // Optional bounded fields
+  if (
+    typeof value.system_prompt === "string" &&
+    !withinBytes(value.system_prompt, MAX_SYSTEM_PROMPT_BYTES)
+  ) {
+    return false;
+  }
+  if (
+    typeof value.avatar_url === "string" &&
+    !withinBytes(value.avatar_url, MAX_AVATAR_URL_BYTES)
+  ) {
+    return false;
+  }
+  for (const field of ["runtime", "model", "provider"] as const) {
+    const v = value[field];
+    if (typeof v === "string") {
+      if (v.trim().length === 0 || !withinBytes(v, MAX_IDENTIFIER_BYTES)) {
+        return false;
+      }
+    }
+  }
+
+  // name_pool: entry count and per-entry bounds
+  if (Array.isArray(value.name_pool)) {
+    if (value.name_pool.length > MAX_NAME_POOL_ENTRIES) return false;
+    for (const entry of value.name_pool) {
+      if (
+        typeof entry !== "string" ||
+        entry.trim().length === 0 ||
+        !withinBytes(entry, MAX_NAME_BYTES)
+      ) {
+        return false;
+      }
+    }
+  }
+
+  // respond_to: recognized wire values only
+  if (
+    value.respond_to !== undefined &&
+    value.respond_to !== null &&
+    (typeof value.respond_to !== "string" ||
+      !RESPOND_TO_VALUES.has(value.respond_to))
+  ) {
+    return false;
+  }
+
+  // parallelism: 1–32 when present
+  if (value.parallelism !== undefined && value.parallelism !== null) {
+    if (
+      typeof value.parallelism !== "number" ||
+      !Number.isInteger(value.parallelism) ||
+      value.parallelism < 1 ||
+      value.parallelism > 32
+    ) {
+      return false;
+    }
+  }
+
+  // Built-in reuse hint: either both present or both absent
+  const hasSlug =
+    typeof value.builtin_slug === "string" && value.builtin_slug.length > 0;
+  const hasHash =
+    typeof value.projection_hash === "string" &&
+    value.projection_hash.length > 0;
+  if (hasSlug !== hasHash) return false;
+  if (hasSlug) {
+    if (!withinBytes(value.builtin_slug as string, MAX_BUILTIN_SLUG_BYTES)) {
+      return false;
+    }
+    // projection_hash must be a 64-char hex digest
+    if (!/^[0-9a-f]{64}$/.test(value.projection_hash as string)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function parseMember(value: unknown): CatalogTeamMember | null {
+  if (!isObject(value)) return null;
+  // Display-layer parsing: only needs the fields the UI renders.
+  // Full schema validation is done by memberPassesV1 and by the backend
+  // re-fetch on add.
+  if (
     typeof value.member_key !== "string" ||
     value.member_key.length === 0 ||
     typeof value.display_name !== "string" ||
@@ -80,18 +216,22 @@ function parseMember(value: unknown): CatalogTeamMember | null {
 /**
  * Parse a 30178 content body, rejecting an unrecognized schema version.
  *
+ * Returns `null` when the body cannot be parsed at all (wrong version,
+ * malformed JSON, missing required top-level fields, member-count cap
+ * exceeded, or total-size cap exceeded). Otherwise returns the parsed
+ * name/description/instructions/members and an `invalidMemberCount` for
+ * members that fail the v1 contract. A non-zero count means the team should
+ * be shown with a diagnostic and Add should be disabled.
+ *
  * Version dispatch happens before field access, mirroring the backend: a
  * future `v: 2` body may legally reshape any field, so rendering whatever
  * happens to parse as `v: 1` would present a corrupted team as a valid one.
- * A single unparsable member fails the whole projection rather than being
- * skipped — a team shown with a member missing is a different team than the
- * one its owner published.
  */
 export function parseTeamCatalogContent(
   event: RelayEvent,
 ): Pick<
   CatalogTeam,
-  "name" | "description" | "instructions" | "members"
+  "name" | "description" | "instructions" | "members" | "invalidMemberCount"
 > | null {
   let parsed: unknown;
   try {
@@ -104,15 +244,51 @@ export function parseTeamCatalogContent(
     parsed.v !== TEAM_CATALOG_SCHEMA_VERSION ||
     typeof parsed.name !== "string" ||
     parsed.name.trim().length === 0 ||
+    !withinBytes(parsed.name, MAX_NAME_BYTES) ||
     !Array.isArray(parsed.members)
   ) {
     return null;
   }
 
+  // Team-level text bounds
+  if (
+    typeof parsed.description === "string" &&
+    !withinBytes(parsed.description, MAX_TEXT_BYTES)
+  ) {
+    return null;
+  }
+  if (
+    typeof parsed.instructions === "string" &&
+    !withinBytes(parsed.instructions, MAX_TEXT_BYTES)
+  ) {
+    return null;
+  }
+
+  // Member count cap: a body that exceeds this cannot be adopted anyway
+  if (parsed.members.length > MAX_MEMBERS) {
+    return null;
+  }
+
+  // Total-size cap: same reasoning
+  if (byteLength(event.content) > MAX_TOTAL_BYTES) {
+    return null;
+  }
+
+  // Parse display-layer fields; track members that fail v1 validation
   const members: CatalogTeamMember[] = [];
+  let invalidMemberCount = 0;
   for (const candidate of parsed.members) {
+    if (!memberPassesV1(candidate)) {
+      invalidMemberCount++;
+      continue; // include the invalid count but still render the valid members
+    }
     const member = parseMember(candidate);
-    if (!member) return null;
+    if (!member) {
+      // parseMember is a subset of memberPassesV1; this branch is unreachable
+      // for a candidate that passed v1, but guard defensively.
+      invalidMemberCount++;
+      continue;
+    }
     members.push(member);
   }
 
@@ -121,6 +297,7 @@ export function parseTeamCatalogContent(
     description: optionalString(parsed.description),
     instructions: optionalString(parsed.instructions),
     members,
+    invalidMemberCount,
   };
 }
 
