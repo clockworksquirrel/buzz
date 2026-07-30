@@ -27,31 +27,6 @@ pub(super) struct PreparedTeamPublication {
     pub team: TeamRecord,
 }
 
-/// Resolve the members of `team` from `personas`, in the team's own
-/// membership order.
-///
-/// Order is load-bearing: it is part of the canonical projection bytes, so
-/// resolving through a map would make an unchanged team hash differently on
-/// each rebuild. An unresolvable id is an error rather than a skip — silently
-/// publishing a team with a member missing would present a different team to
-/// the community than the one the owner is looking at, and (A3) the reconcile
-/// treats exactly this failure as grounds for retraction.
-pub(super) fn resolve_team_members(
-    team: &TeamRecord,
-    personas: &[AgentDefinition],
-) -> Result<Vec<AgentDefinition>, String> {
-    team.persona_ids
-        .iter()
-        .map(|persona_id| {
-            personas
-                .iter()
-                .find(|record| &record.id == persona_id)
-                .cloned()
-                .ok_or_else(|| format!("team member {persona_id} not found"))
-        })
-        .collect()
-}
-
 /// Whether a retained catalog head carries the exact `shared` tag.
 ///
 /// Reuses `event_is_shared`, the same fail-closed exact-shape check the relay

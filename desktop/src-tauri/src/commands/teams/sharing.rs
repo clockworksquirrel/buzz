@@ -19,7 +19,8 @@ use crate::{
     },
 };
 
-use super::pending::{prepare_team_publication, resolve_team_members, PreparedTeamPublication};
+use super::pending::{prepare_team_publication, PreparedTeamPublication};
+use crate::managed_agents::team_catalog::resolve_team_members;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]

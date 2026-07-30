@@ -173,29 +173,6 @@ fn test_oversized_team_fails_before_anything_is_enqueued() {
     );
 }
 
-// ── Member resolution ────────────────────────────────────────────────────────
-
-#[test]
-fn test_members_resolve_in_team_membership_order() {
-    let personas = vec![member("m2", "Two"), member("m1", "One")];
-
-    let resolved = resolve_team_members(&team(), &personas).unwrap();
-
-    let ids: Vec<&str> = resolved.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(
-        ids,
-        ["m1", "m2"],
-        "order is part of the canonical bytes, so it follows the team, not the store"
-    );
-}
-
-#[test]
-fn test_unresolvable_member_fails_resolution_rather_than_being_skipped() {
-    let error = resolve_team_members(&team(), &[member("m1", "One")]).unwrap_err();
-
-    assert!(error.contains("team member m2 not found"));
-}
-
 // ── Projection ───────────────────────────────────────────────────────────────
 
 #[test]

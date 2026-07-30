@@ -67,10 +67,10 @@ pub const MAX_TOTAL_BYTES: usize = 192 * 1024;
 /// The JSON body stored in a kind:30178 event's content field.
 ///
 /// Field order is pinned by the struct declaration: serde emits in declaration
-/// order, so a reorder changes the content bytes, the NIP-01 event id, and
-/// [`team_catalog_content_hash`] — which the freshness reconcile compares to
-/// decide whether a shared projection is stale. Reordering would make every
-/// shared team look stale exactly once, republishing the entire catalog.
+/// order, so a reorder changes the content bytes and the NIP-01 event id — and
+/// the freshness reconcile compares exactly those bytes to decide whether a
+/// shared projection is stale. Reordering would make every shared team look
+/// stale exactly once, republishing the entire catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamCatalogContent {
     /// Schema version. First field so a reader can dispatch on it before
@@ -137,12 +137,36 @@ pub struct TeamCatalogMember {
     /// embedded fields above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin_slug: Option<String>,
-    /// Hash of this member's own embedded projection, over the same canonical
-    /// encoding as [`team_catalog_content_hash`]. Meaningful only alongside
-    /// `builtin_slug`; it is what makes the reuse hint exact-match gated
-    /// rather than name-trusting.
+    /// Hash of this member's own embedded projection. Meaningful only
+    /// alongside `builtin_slug`; it is what makes the reuse hint exact-match
+    /// gated rather than name-trusting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection_hash: Option<String>,
+}
+
+/// Resolve the members of `team` from `personas`, in the team's own
+/// membership order.
+///
+/// Order is load-bearing: it is part of the canonical projection bytes, so
+/// resolving through a map would make an unchanged team rebuild to different
+/// bytes each time. An unresolvable id is an error rather than a skip —
+/// silently publishing a team with a member missing would present a different
+/// team to the community than the one the owner is looking at, and the
+/// freshness reconcile treats exactly this failure as grounds for retraction.
+pub fn resolve_team_members(
+    team: &TeamRecord,
+    personas: &[AgentDefinition],
+) -> Result<Vec<AgentDefinition>, String> {
+    team.persona_ids
+        .iter()
+        .map(|persona_id| {
+            personas
+                .iter()
+                .find(|record| &record.id == persona_id)
+                .cloned()
+                .ok_or_else(|| format!("team member {persona_id} not found"))
+        })
+        .collect()
 }
 
 /// There is no `respond_to_allowlist` field on [`TeamCatalogMember`], and that
@@ -207,18 +231,6 @@ fn member_projection_with_reuse_hint(record: &AgentDefinition) -> TeamCatalogMem
 /// what the canonical encoding is.
 pub fn team_catalog_content_json(content: &TeamCatalogContent) -> Result<String, String> {
     serde_json::to_string(content).map_err(|e| format!("failed to serialize team catalog: {e}"))
-}
-
-/// SHA-256 (lowercase hex) of a content body's canonical encoding.
-///
-/// The freshness reconcile compares this digest — not event timestamps — to
-/// decide whether a retained shared head still matches the local team, for the
-/// same reason `persona_content_hash` does: timestamps are fragile across
-/// clock skew, export/import, and multi-device edits, while content is exact.
-pub fn team_catalog_content_hash(content: &TeamCatalogContent) -> String {
-    use sha2::{Digest, Sha256};
-    let json = team_catalog_content_json(content).unwrap_or_default();
-    hex::encode(Sha256::digest(json.as_bytes()))
 }
 
 fn member_projection_hash(member: &TeamCatalogMember) -> String {
@@ -357,6 +369,23 @@ pub fn build_team_catalog_event(
         tags.push(Tag::parse(["shared", "true"]).map_err(|e| format!("invalid shared tag: {e}"))?);
     }
     Ok(EventBuilder::new(Kind::Custom(KIND_TEAM_CATALOG as u16), content_json).tags(tags))
+}
+
+/// Build an unsigned kind:30178 event that republishes `content_json`
+/// verbatim without the `shared` tag.
+///
+/// Retraction re-signs the retained body rather than reprojecting the team,
+/// because retraction is triggered exactly when reprojection is impossible —
+/// a member was deleted, or the team outgrew the size contract. The retained
+/// body was already built and accepted at its own bounds, so replaying it
+/// cannot fail the checks a fresh projection would. The team stays published
+/// and readable by its author; only its discoverability is withdrawn.
+pub fn build_team_catalog_retraction(
+    d_tag: &str,
+    content_json: &str,
+) -> Result<EventBuilder, String> {
+    let tag = Tag::parse(["d", d_tag]).map_err(|e| format!("invalid d-tag: {e}"))?;
+    Ok(EventBuilder::new(Kind::Custom(KIND_TEAM_CATALOG as u16), content_json).tags(vec![tag]))
 }
 
 /// Parse a kind:30178 event body, rejecting an unrecognized schema version.

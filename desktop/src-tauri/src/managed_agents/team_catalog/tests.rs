@@ -130,19 +130,42 @@ fn test_parallelism_is_clamped_into_the_supported_range() {
     }
 }
 
+// ── Member resolution ───────────────────────────────────────────────────────
+
+#[test]
+fn test_members_resolve_in_team_membership_order() {
+    let personas = vec![member("m2", "Two"), member("m1", "One")];
+
+    let resolved = resolve_team_members(&team(), &personas).unwrap();
+
+    let ids: Vec<&str> = resolved.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["m1", "m2"],
+        "order is part of the canonical bytes, so it follows the team, not the store"
+    );
+}
+
+#[test]
+fn test_unresolvable_member_fails_resolution_rather_than_being_skipped() {
+    let error = resolve_team_members(&team(), &[member("m1", "One")]).unwrap_err();
+
+    assert!(error.contains("team member m2 not found"));
+}
+
 // ── Determinism (the reconcile depends on it) ───────────────────────────────
 
 #[test]
-fn test_rebuilding_an_unchanged_team_reproduces_an_identical_hash() {
-    // The freshness reconcile republishes on hash mismatch, so a builder that
-    // is not deterministic would republish the whole catalog on every boot.
+fn test_rebuilding_an_unchanged_team_reproduces_identical_bytes() {
+    // The freshness reconcile republishes on a byte mismatch, so a builder
+    // that is not deterministic would republish the whole catalog every boot.
     let members = [member("m1", "One"), member("m2", "Two")];
     let first = build_team_catalog_content(&team(), &members).unwrap();
     let second = build_team_catalog_content(&team(), &members).unwrap();
 
     assert_eq!(
-        team_catalog_content_hash(&first),
-        team_catalog_content_hash(&second)
+        team_catalog_content_json(&first),
+        team_catalog_content_json(&second)
     );
 }
 
@@ -154,19 +177,19 @@ fn test_member_order_is_part_of_the_canonical_bytes() {
     let a = build_team_catalog_content(&team(), &forward).unwrap();
     let b = build_team_catalog_content(&team(), &reversed).unwrap();
 
-    assert_ne!(team_catalog_content_hash(&a), team_catalog_content_hash(&b));
+    assert_ne!(team_catalog_content_json(&a), team_catalog_content_json(&b));
 }
 
 #[test]
-fn test_editing_a_member_definition_changes_the_team_hash() {
+fn test_editing_a_member_definition_changes_the_team_bytes() {
     let before = build_team_catalog_content(&team(), &[member("m1", "One")]).unwrap();
     let mut edited = member("m1", "One");
     edited.system_prompt = "Do the work differently.".to_string();
     let after = build_team_catalog_content(&team(), &[edited]).unwrap();
 
     assert_ne!(
-        team_catalog_content_hash(&before),
-        team_catalog_content_hash(&after)
+        team_catalog_content_json(&before),
+        team_catalog_content_json(&after)
     );
 }
 
