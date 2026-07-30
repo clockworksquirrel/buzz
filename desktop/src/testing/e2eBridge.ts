@@ -1099,6 +1099,12 @@ declare global {
       members: MockHuddleMemberSeed[];
       transcriptionEnabled: boolean;
     }) => Promise<void>;
+    /**
+     * Replace the stored kind:30178 head for a coordinate WITHOUT notifying
+     * live subscribers. Reproduces a head that moved on the relay while a
+     * catalog dialog sat open holding the superseded event id.
+     */
+    __BUZZ_E2E_REPLACE_MOCK_TEAM_CATALOG_HEAD__?: (event: RelayEvent) => void;
     __BUZZ_E2E_PUSH_MOCK_FEED_ITEM__?: (item: RawFeedItem) => RawFeedItem;
     /** Replace an existing feed item by id (or push if not found) and fire the updated event. */
     __BUZZ_E2E_REPLACE_MOCK_FEED_ITEM__?: (
@@ -9924,6 +9930,18 @@ export function maybeInstallE2eTauriMocks() {
     ownerPubkey,
     kind,
   }) => hasMockOwnerKindSubscription(ownerPubkey, kind);
+  window.__BUZZ_E2E_REPLACE_MOCK_TEAM_CATALOG_HEAD__ = (event) => {
+    const dTag = event.tags.find((tag) => tag[0] === "d")?.[1];
+    const existingIndex = mockTeamCatalogEvents.findIndex(
+      (candidate) =>
+        candidate.pubkey.toLowerCase() === event.pubkey.toLowerCase() &&
+        candidate.tags.some((tag) => tag[0] === "d" && tag[1] === dTag),
+    );
+    if (existingIndex >= 0) {
+      mockTeamCatalogEvents.splice(existingIndex, 1);
+    }
+    mockTeamCatalogEvents.push(event);
+  };
   window.__BUZZ_E2E_PUSH_MOCK_FEED_ITEM__ = (item) => {
     const category = item.category === "mention" ? "mentions" : item.category;
     mockFeedOverrides[category].unshift(item);
