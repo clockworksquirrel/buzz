@@ -172,6 +172,8 @@ pub(crate) fn build_import_team(
         persona_ids,
         instructions: snapshot.team.instructions.clone(),
         is_builtin: false,
+        // An imported team starts unshared; sharing is an explicit choice.
+        shared: false,
         source_dir: None,
         is_symlink: false,
         symlink_target: None,

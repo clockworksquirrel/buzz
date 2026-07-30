@@ -59,6 +59,8 @@ fn built_in_team_records(built_ins: &[BuiltInTeam], now: &str) -> Vec<TeamRecord
             instructions: None,
             persona_ids: team.persona_ids.iter().map(|s| s.to_string()).collect(),
             is_builtin: true,
+            // Built-in teams are never shareable to the catalog.
+            shared: false,
             source_dir: None,
             is_symlink: false,
             symlink_target: None,

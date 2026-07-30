@@ -771,6 +771,11 @@ pub struct TeamRecord {
     pub persona_ids: Vec<String>,
     #[serde(default)]
     pub is_builtin: bool,
+    /// Whether this team is discoverable in the currently active community.
+    /// View projection recomputed from the relay+owner-scoped kind:30178 head
+    /// on every read — see [`AgentDefinition::shared`].
+    #[serde(default)]
+    pub shared: bool,
     /// Absolute path to the team's backing directory (if directory-backed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_dir: Option<PathBuf>,

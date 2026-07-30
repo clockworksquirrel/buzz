@@ -240,6 +240,7 @@ mod tests {
             instructions: None,
             persona_ids: vec![],
             is_builtin: false,
+            shared: false,
             source_dir: None,
             is_symlink: false,
             symlink_target: None,

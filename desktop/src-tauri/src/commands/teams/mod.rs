@@ -25,6 +25,10 @@ fn trim_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+mod pending;
+mod sharing;
+pub use sharing::set_team_shared;
+
 /// Retain a freshly authored team event in the local store, flagged for relay
 /// sync. Called inside a command's `managed_agents_store_lock`-held body after
 /// `save_teams`; the background flush loop publishes it out-of-band.
@@ -134,7 +138,9 @@ pub async fn list_teams(app: AppHandle) -> Result<Vec<TeamRecord>, String> {
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        load_teams(&app)
+        let mut teams = load_teams(&app)?;
+        pending::project_active_team_sharing(&app, &state, &mut teams);
+        Ok(teams)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
@@ -164,6 +170,9 @@ pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<Tea
             instructions,
             persona_ids: input.persona_ids,
             is_builtin: false,
+            // View projection only — `list_teams` recomputes it from the
+            // scoped 30178 head. A new team has no catalog head yet.
+            shared: false,
             source_dir: None,
             is_symlink: false,
             symlink_target: None,
@@ -197,6 +206,7 @@ pub async fn update_team(input: UpdateTeamRequest, app: AppHandle) -> Result<Tea
         let personas = load_personas(&app)?;
         ensure_persona_ids_are_active(&personas, &input.persona_ids)?;
         let mut teams = load_teams(&app)?;
+        pending::project_active_team_sharing(&app, &state, &mut teams);
         let team = teams
             .iter_mut()
             .find(|record| record.id == input.id)
@@ -234,6 +244,11 @@ pub async fn delete_team(id: String, app: AppHandle) -> Result<(), String> {
         // so reaching here means this team was owner-published — tombstone it. The
         // d_tag is the team id, captured before the record left the store.
         tombstone_team_pending(&app, &state, &id);
+        // The catalog projection is a separate coordinate with its own
+        // retained head, so the 30176 tombstone above does not retract it.
+        // Without this, deleting a shared team would leave a live catalog
+        // entry the owner can no longer see or unshare.
+        pending::tombstone_team_catalog_pending(&app, &state, &id);
         // Tombstone the cascaded personas too, so their orphaned kind:30175 heads
         // don't linger on the relay (F4). Each d-tag was captured pre-removal.
         for persona_d_tag in &cascaded_persona_d_tags {

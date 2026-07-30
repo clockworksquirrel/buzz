@@ -849,6 +849,7 @@ pub fn run() {
             list_teams,
             create_team,
             update_team,
+            set_team_shared,
             delete_team,
             export_agent_snapshot,
             preview_agent_snapshot_import,
