@@ -9,7 +9,7 @@ export const teamCatalogCopy = {
   addingAction: "Adding…",
   shareTitle: "Share to catalog",
   shareDescription:
-    "Anyone in this community can find and add a copy of this team. Every member's instruction is shared as plaintext. Memories and secrets aren't included.",
+    "Anyone in this community can find and add a copy of this team. Both the team instructions and every member’s instructions are shared as plaintext. Memories and secrets aren’t included.",
   shareAriaLabel: "What to share in the catalog",
   notSharedOption: "Not shared",
   sharedOption: "Shared",

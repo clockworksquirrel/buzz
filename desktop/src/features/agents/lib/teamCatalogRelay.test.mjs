@@ -564,3 +564,27 @@ test("test_description_too_long_returns_null", () => {
   };
   assert.equal(parseTeamCatalogContent(contentEvent(body)), null);
 });
+
+// ── F8: share disclosure copy contract ───────────────────────────────────
+// Both team instructions AND member instructions are published as plaintext.
+// The copy must name both to satisfy the explicit disclosure requirement.
+
+test("test_share_disclosure_names_team_instructions", () => {
+  assert.ok(
+    teamCatalogCopy.shareDescription
+      .toLowerCase()
+      .includes("team instructions"),
+    "disclosure must mention team instructions",
+  );
+});
+
+test("test_share_disclosure_names_member_instructions", () => {
+  assert.ok(
+    teamCatalogCopy.shareDescription.toLowerCase().includes("member"),
+    "disclosure must mention member instructions",
+  );
+  assert.ok(
+    teamCatalogCopy.shareDescription.toLowerCase().includes("instructions"),
+    "disclosure must explicitly say instructions are shared",
+  );
+});
