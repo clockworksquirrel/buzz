@@ -15,6 +15,7 @@ import { AgentSnapshotExportDialog } from "./AgentSnapshotExportDialog";
 import { AgentSnapshotImportDialog } from "./AgentSnapshotImportDialog";
 import { TeamSnapshotExportDialog } from "./TeamSnapshotExportDialog";
 import { TeamSnapshotImportDialog } from "./TeamSnapshotImportDialog";
+import { TeamCatalogDialog } from "./TeamCatalogDialog";
 import { TeamShareDialog } from "./TeamShareDialog";
 import { SecretRevealDialog } from "./SecretRevealDialog";
 import { TeamDeleteDialog } from "./TeamDeleteDialog";
@@ -288,6 +289,7 @@ export function AgentsView() {
               onDuplicate={teamActions.openDuplicateDialog}
               onEdit={teamActions.openEditDialog}
               onAddToChannel={teamActions.setTeamToAddToChannel}
+              onDiscover={teamActions.openCatalog}
               onShare={teamActions.openShare}
               onImport={() => {
                 teamImportInputRef.current?.click();
@@ -515,6 +517,23 @@ export function AgentsView() {
           personas={personas.catalogPersonas}
         />
       ) : null}
+      {teamActions.isCatalogDialogOpen ? (
+        <TeamCatalogDialog
+          error={
+            teamActions.catalogQuery.error instanceof Error
+              ? teamActions.catalogQuery.error
+              : null
+          }
+          isAdding={teamActions.isAddingFromCatalog}
+          isLoading={teamActions.catalogQuery.isLoading}
+          onAddTeam={(team) => {
+            void teamActions.handleAddTeamFromCatalog(team);
+          }}
+          onOpenChange={teamActions.setIsCatalogDialogOpen}
+          open={teamActions.isCatalogDialogOpen}
+          teams={teamActions.catalogTeams}
+        />
+      ) : null}
       {teamActions.teamDialogState ? (
         <TeamDialog
           description={teamActions.teamDialogState.description}
@@ -572,11 +591,23 @@ export function AgentsView() {
       ) : null}
       {teamActions.teamToShare ? (
         <TeamShareDialog
+          catalogShareLevel={teamActions.getTeamCatalogShareLevel(
+            teamActions.teamToShare,
+          )}
           isPending={
             teamActions.createTeamMutation.isPending ||
             teamActions.updateTeamMutation.isPending ||
-            teamActions.deleteTeamMutation.isPending
+            teamActions.deleteTeamMutation.isPending ||
+            teamActions.isCatalogSharePending
           }
+          onCatalogShareLevelChange={(shareLevel) => {
+            if (teamActions.teamToShare) {
+              void teamActions.setTeamCatalogShareLevel(
+                teamActions.teamToShare,
+                shareLevel,
+              );
+            }
+          }}
           onExport={() => {
             if (teamActions.teamToShare) {
               const team = teamActions.teamToShare;
