@@ -456,12 +456,15 @@ fn test_a_second_team_by_the_same_publisher_gets_its_own_member_copies() {
 
 #[test]
 fn test_a_deactivated_copy_is_reactivated_rather_than_duplicated() {
-    // Deleting an added team leaves its member copies inactive. Re-adding the
-    // same publication must revive them, not stack a second set.
+    // `delete_team_with_cascade` deactivates (not deletes) member copies when
+    // a catalog-adopted team is removed. Re-adding the same publication must
+    // revive the existing copies rather than stacking a second set. This test
+    // verifies `plan_add`'s reactivation branch in isolation; the production
+    // deactivation path is covered by `teams_tests::test_delete_then_re_add_*`.
     let source = source(&"a".repeat(64));
     let body = content(vec![member("m1", "Do the work.")]);
     let (mut personas, _) = plan(&[], &[], &source, &body).stores.unwrap();
-    personas[0].is_active = false;
+    personas[0].is_active = false; // mirrors what delete_team_with_cascade does
 
     let (after, _) = plan(&personas, &[], &source, &body)
         .stores
@@ -712,6 +715,42 @@ fn test_provenance_survives_a_store_round_trip() {
 
 fn clone_provenance(value: &TeamMemberCatalogSource) -> TeamMemberCatalogSource {
     value.clone()
+}
+
+#[test]
+fn test_delete_then_re_add_reactivates_copies() {
+    // End-to-end lifecycle for F4: add a team, deactivate its copies (what
+    // delete_team_with_cascade does for catalog-adopted teams), then re-add the
+    // same publication. The re-add must reuse and reactivate the existing copies
+    // rather than minting duplicates.
+    use crate::managed_agents::deactivate_catalog_member_copies;
+
+    let owner = "a".repeat(64);
+    let src = source(&owner);
+    let body = content(vec![member("mk1", "Do it.")]);
+    const NOW: &str = "2026-01-01T00:00:00Z";
+
+    // Step 1: initial add
+    let initial = plan(&[], &[], &src, &body).stores.unwrap();
+    let (mut personas, mut teams) = initial;
+    assert_eq!(personas.len(), 1);
+    assert!(personas[0].is_active);
+    let copy_id = personas[0].id.clone();
+
+    // Step 2: simulate delete — deactivate the member copies and remove the team
+    let changed = deactivate_catalog_member_copies(&mut personas, &owner, TEAM_D_TAG);
+    assert!(changed, "deactivation must report a change");
+    assert!(!personas[0].is_active, "copy is deactivated after delete");
+    teams.clear();
+
+    // Step 3: re-add — must reactivate the existing copy, not mint a new one
+    let readd = plan(&personas, &teams, &src, &body)
+        .stores
+        .expect("re-add must compute new stores");
+    let (after_personas, _) = readd;
+    assert_eq!(after_personas.len(), 1, "no duplicate copies minted");
+    assert_eq!(after_personas[0].id, copy_id, "same record reused");
+    assert!(after_personas[0].is_active, "record is reactivated");
 }
 
 // ── commit_stores: byte-level rollback coverage ───────────────────────────

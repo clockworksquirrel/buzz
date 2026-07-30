@@ -238,7 +238,10 @@ fn agents_referencing_team<'a>(
 /// enqueue NIP-09 tombstones for them — without this, the team coordinate is
 /// tombstoned but the orphaned kind:30175 persona heads stay live on the relay.
 /// For JSON-only teams (no `source_dir`), nothing cascades and the returned
-/// vec is empty.
+/// vec is empty. For catalog-adopted teams (`catalog_source` present), member
+/// copies whose provenance matches this publication are deactivated rather than
+/// deleted — they are re-activatable if the same team is re-added from the
+/// catalog.
 pub fn delete_team_with_cascade(app: &AppHandle, team_id: &str) -> Result<Vec<String>, String> {
     let mut teams = load_teams(app)?;
     let team = teams
@@ -294,12 +297,53 @@ pub fn delete_team_with_cascade(app: &AppHandle, team_id: &str) -> Result<Vec<St
                 }
             }
         }
+    } else if let Some(catalog_source) = &team.catalog_source.clone() {
+        // Catalog-adopted team: deactivate member copies whose provenance
+        // matches this publication. Built-in reuse substitutions (`is_builtin`)
+        // are never copies and must not be touched. Deactivation rather than
+        // deletion lets re-adding the same publication reactivate them rather
+        // than minting fresh copies with new IDs.
+        let mut personas = super::load_personas(app)?;
+        let changed = deactivate_catalog_member_copies(
+            &mut personas,
+            &catalog_source.owner_pubkey,
+            &catalog_source.team_d_tag,
+        );
+        if changed {
+            super::save_personas(app, &personas)?;
+        }
     }
 
-    // 4. Remove TeamRecord
+    // Remove TeamRecord
     teams.retain(|record| record.id != team_id);
     save_teams(app, &teams)?;
     Ok(cascaded_persona_d_tags)
+}
+
+/// Deactivate all non-built-in personas whose `team_catalog_source` matches
+/// `(owner_pubkey, team_d_tag)`. Returns `true` when any record was changed.
+///
+/// Extracted so the deactivation logic is testable without an AppHandle.
+pub(crate) fn deactivate_catalog_member_copies(
+    personas: &mut Vec<super::AgentDefinition>,
+    owner_pubkey: &str,
+    team_d_tag: &str,
+) -> bool {
+    let mut changed = false;
+    for persona in personas.iter_mut() {
+        if persona.is_builtin {
+            continue;
+        }
+        let is_copy = persona
+            .team_catalog_source
+            .as_ref()
+            .is_some_and(|s| s.owner_pubkey == owner_pubkey && s.team_d_tag == team_d_tag);
+        if is_copy && persona.is_active {
+            persona.is_active = false;
+            changed = true;
+        }
+    }
+    changed
 }
 
 #[cfg(test)]

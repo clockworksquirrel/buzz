@@ -4,10 +4,12 @@
 //! `#[path]`-included from there.
 
 use super::{
-    agents_referencing_team, load_teams_readonly, merge_teams, merge_teams_impl, sort_teams,
-    validate_team_deletion, BuiltInTeam,
+    agents_referencing_team, deactivate_catalog_member_copies, load_teams_readonly, merge_teams,
+    merge_teams_impl, sort_teams, validate_team_deletion, BuiltInTeam,
 };
-use crate::managed_agents::{ManagedAgentRecord, TeamRecord};
+use crate::managed_agents::{
+    AgentDefinition, ManagedAgentRecord, TeamCatalogSource, TeamMemberCatalogSource, TeamRecord,
+};
 
 fn team(id: &str, name: &str) -> TeamRecord {
     TeamRecord {
@@ -439,5 +441,119 @@ fn load_teams_readonly_surfaces_read_error() {
     assert!(
         result.unwrap_err().contains("failed to read teams store"),
         "read error must be surfaced"
+    );
+}
+
+// ── deactivate_catalog_member_copies ─────────────────────────────────────
+
+const OWNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const D_TAG: &str = "my-team";
+
+fn catalog_copy(id: &str, owner: &str, d_tag: &str) -> AgentDefinition {
+    AgentDefinition {
+        id: id.to_string(),
+        display_name: id.to_string(),
+        avatar_url: None,
+        system_prompt: String::new(),
+        runtime: None,
+        model: None,
+        provider: None,
+        name_pool: Vec::new(),
+        is_builtin: false,
+        is_active: true,
+        shared: false,
+        source_team: None,
+        source_team_persona_slug: None,
+        catalog_source: None,
+        team_catalog_source: Some(TeamMemberCatalogSource {
+            owner_pubkey: owner.to_string(),
+            team_d_tag: d_tag.to_string(),
+            member_key: id.to_string(),
+            projection_hash: "hash".to_string(),
+        }),
+        env_vars: Default::default(),
+        respond_to: None,
+        respond_to_allowlist: Vec::new(),
+        parallelism: None,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+    }
+}
+
+fn builtin_copy(id: &str) -> AgentDefinition {
+    let mut p = catalog_copy(id, OWNER, D_TAG);
+    p.is_builtin = true;
+    p
+}
+
+#[test]
+fn test_deactivate_catalog_member_copies_deactivates_matching_copies() {
+    let mut personas = vec![
+        catalog_copy("m1", OWNER, D_TAG),
+        catalog_copy("m2", OWNER, D_TAG),
+    ];
+    let changed = deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    assert!(changed);
+    assert!(!personas[0].is_active, "m1 should be deactivated");
+    assert!(!personas[1].is_active, "m2 should be deactivated");
+}
+
+#[test]
+fn test_deactivate_catalog_member_copies_skips_different_owner() {
+    let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let mut personas = vec![catalog_copy("m1", other, D_TAG)];
+    let changed = deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    assert!(!changed, "different owner must not be deactivated");
+    assert!(personas[0].is_active);
+}
+
+#[test]
+fn test_deactivate_catalog_member_copies_skips_different_d_tag() {
+    let mut personas = vec![catalog_copy("m1", OWNER, "other-team")];
+    let changed = deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    assert!(!changed, "different d-tag must not be deactivated");
+    assert!(personas[0].is_active);
+}
+
+#[test]
+fn test_deactivate_catalog_member_copies_skips_builtins() {
+    // Built-in substitutions are local records, not copies — deleting the team
+    // must never deactivate them.
+    let mut personas = vec![builtin_copy("builtin:fizz")];
+    let changed = deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    assert!(!changed, "built-in should not be deactivated");
+    assert!(personas[0].is_active);
+}
+
+#[test]
+fn test_deactivate_catalog_member_copies_skips_already_inactive() {
+    let mut personas = vec![{
+        let mut p = catalog_copy("m1", OWNER, D_TAG);
+        p.is_active = false;
+        p
+    }];
+    let changed = deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    assert!(
+        !changed,
+        "already-inactive record should not count as a change"
+    );
+}
+
+#[test]
+fn test_deactivate_catalog_member_copies_is_scoped_per_publication() {
+    // A copy belonging to a DIFFERENT team by the same publisher must not be
+    // deactivated — it belongs to a separate adoption.
+    let mut personas = vec![
+        catalog_copy("m1", OWNER, D_TAG),
+        catalog_copy("m2", OWNER, "other-team"),
+    ];
+    deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    assert!(
+        !personas[0].is_active,
+        "m1 (matching) should be deactivated"
+    );
+    assert!(
+        personas[1].is_active,
+        "m2 (different d-tag) should remain active"
     );
 }
