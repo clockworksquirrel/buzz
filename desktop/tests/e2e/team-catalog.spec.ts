@@ -261,6 +261,87 @@ test("a head that moved while the dialog was open is rejected", async ({
   ).toHaveLength(0);
 });
 
+test("a lower-id head at the same timestamp is correctly selected as canonical and rejected as stale", async ({
+  page,
+}) => {
+  // Two events for the same coordinate at identical created_at. The relay's
+  // tie-break is `id ASC` so the lower-id event is canonical. The mock must
+  // agree: only the lower-id event should be selected as the head; presenting
+  // the higher-id event id when the bridge holds the lower-id one must be
+  // rejected as stale.
+  const SAME_TIMESTAMP = 1_721_760_000;
+  const LOWER_ID = "1".repeat(64); // lexicographically first — canonical
+  const HIGHER_ID = "9".repeat(64); // lexicographically second — not canonical
+
+  const entryKey = `${TEST_IDENTITIES.alice.pubkey}:${ALICE_TEAM_D_TAG}`;
+  await installMockBridge(page, {
+    teamCatalogEvents: [
+      createTeamCatalogEvent({
+        ownerPubkey: TEST_IDENTITIES.alice.pubkey,
+        teamDTag: ALICE_TEAM_D_TAG,
+        name: "Alice's Review Crew",
+        members: ALICE_TEAM_MEMBERS,
+        createdAt: SAME_TIMESTAMP,
+        eventId: LOWER_ID,
+      }),
+      createTeamCatalogEvent({
+        ownerPubkey: TEST_IDENTITIES.alice.pubkey,
+        teamDTag: ALICE_TEAM_D_TAG,
+        name: "Alice's Review Crew v2",
+        members: [],
+        createdAt: SAME_TIMESTAMP,
+        eventId: HIGHER_ID,
+      }),
+    ],
+  });
+  await gotoAgentsView(page);
+  await openTeamCatalog(page);
+  // The UI rendered the lower-id head (canonical); click to open the detail.
+  await page.getByTestId(`team-catalog-list-item-${entryKey}`).click();
+
+  // Silently replace the stored head with the higher-id event (same timestamp).
+  // The dialog still holds LOWER_ID; the bridge now considers HIGHER_ID
+  // canonical. The add must be rejected as stale.
+  await page.evaluate(
+    ({ ownerPubkey, teamDTag }) => {
+      const replace = (
+        window as Window & {
+          __BUZZ_E2E_REPLACE_MOCK_TEAM_CATALOG_HEAD__?: (
+            event: unknown,
+          ) => void;
+        }
+      ).__BUZZ_E2E_REPLACE_MOCK_TEAM_CATALOG_HEAD__;
+      if (!replace) throw new Error("Team catalog head seam is not installed.");
+      replace({
+        id: "9".repeat(64),
+        pubkey: ownerPubkey,
+        created_at: 1_721_760_000,
+        kind: 30178,
+        tags: [
+          ["d", teamDTag],
+          ["shared", "true"],
+        ],
+        content: JSON.stringify({
+          v: 1,
+          name: "Alice's Review Crew v2",
+          description: null,
+          instructions: null,
+          members: [],
+        }),
+        sig: "2".repeat(128),
+      });
+    },
+    { ownerPubkey: TEST_IDENTITIES.alice.pubkey, teamDTag: ALICE_TEAM_D_TAG },
+  );
+
+  await page.getByTestId("team-catalog-add-team").click();
+  await expect(
+    page.getByText(
+      "This team was updated since you opened the catalog. Reopen it and try again.",
+    ),
+  ).toBeVisible();
+});
+
 test("sharing a team publishes it to the catalog and unsharing retracts it", async ({
   page,
 }) => {

@@ -8066,7 +8066,10 @@ async function handleAddTeamFromCatalog(args: {
         event.tags.filter((tag) => tag[0] === "d").length === 1 &&
         event.tags.some((tag) => tag[0] === "d" && tag[1] === teamDTag),
     )
-    .sort((left, right) => right.created_at - left.created_at)[0];
+    .sort(
+      (left, right) =>
+        right.created_at - left.created_at || left.id.localeCompare(right.id),
+    )[0];
 
   if (!head || !hasExactSharedTag(head)) {
     throw new Error("This team is no longer shared to the catalog.");
