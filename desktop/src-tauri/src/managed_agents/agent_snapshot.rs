@@ -540,6 +540,7 @@ mod tests {
             source_team_persona_slug: Some("lep".to_string()), // MUST NOT appear
             definition_respond_to: Some("allowlist".to_string()),
             catalog_source: None,
+            team_catalog_source: None,
             definition_respond_to_allowlist: vec!["abc123def".to_string()],
             definition_parallelism: Some(4),
             relay_mesh: None,
@@ -986,7 +987,6 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unsupported snapshot format"));
     }
-
     #[test]
     fn unsupported_version_is_rejected() {
         let mut snapshot = build_snapshot(&minimal_record(), MemoryLevel::None, vec![], None);

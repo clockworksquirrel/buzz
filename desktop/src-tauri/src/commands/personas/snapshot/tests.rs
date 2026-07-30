@@ -69,6 +69,7 @@ fn make_definition(slug: &str) -> ManagedAgentRecord {
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,
@@ -987,7 +988,6 @@ fn validate_encode_size_png_at_boundary_minus_1_passes() {
 fn validate_encode_size_png_at_boundary_passes() {
     assert!(super::validate_snapshot_encode_size(MAX_SNAPSHOT_PNG_BYTES, true).is_ok());
 }
-
 /// PNG: boundary+1 is rejected.
 #[test]
 fn validate_encode_size_png_over_boundary_is_rejected() {

@@ -239,6 +239,18 @@ fn member_projection_hash(member: &TeamCatalogMember) -> String {
     hex::encode(Sha256::digest(&json))
 }
 
+/// The projection hash a recipient computes for one of its OWN local records,
+/// to compare against a published member's `projection_hash`.
+///
+/// This is the reader half of the built-in reuse hint: the publisher stamps
+/// `projection_hash` over the hint-free projection, and the recipient
+/// recomputes it here from its own local built-in. Equality means the two
+/// installs hold a byte-identical definition, which is the only condition
+/// under which substituting the local record for the published one is safe.
+pub fn local_member_projection_hash(record: &AgentDefinition) -> String {
+    member_projection_hash(&member_projection(record))
+}
+
 fn bounded(value: &str, max: usize, label: &str) -> Result<(), String> {
     if value.len() > max {
         return Err(format!(

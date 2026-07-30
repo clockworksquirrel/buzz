@@ -25,8 +25,10 @@ fn trim_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+mod adopt;
 mod pending;
 mod sharing;
+pub use adopt::add_team_from_catalog;
 pub use sharing::set_team_shared;
 
 /// Retain a freshly authored team event in the local store, flagged for relay
@@ -173,6 +175,7 @@ pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<Tea
             // View projection only — `list_teams` recomputes it from the
             // scoped 30178 head. A new team has no catalog head yet.
             shared: false,
+            catalog_source: None,
             source_dir: None,
             is_symlink: false,
             symlink_target: None,

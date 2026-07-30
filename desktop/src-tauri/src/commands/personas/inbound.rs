@@ -441,6 +441,9 @@ fn apply_inbound_team(teams: &mut Vec<TeamRecord>, d_tag: String, inbound: TeamE
             is_builtin: false,
             // Catalog share state is scoped and never inbound-authoritative.
             shared: false,
+            // Owner-device sync, not a catalog add: the team is this owner's
+            // own, so it has no foreign publication to attribute.
+            catalog_source: None,
             source_dir: None,
             is_symlink: false,
             symlink_target: None,
