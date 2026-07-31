@@ -325,11 +325,11 @@ fn migrate_teams_in_dir_at(
 /// - The team still projects and the bytes changed → republish a newer shared
 ///   head.
 /// - The team can no longer be projected at all (a member was deleted, or it
-///   outgrew the size contract) → **retract** it, by republishing the retained
-///   body without the `shared` tag. Leaving the stale head shared would keep
-///   advertising a team the owner can no longer produce, and deleting the
-///   coordinate would destroy a head the owner may still want to re-share once
-///   the cause is fixed.
+///   outgrew the size contract) → **purge + tombstone** (I4). Keeping the stale
+///   body as an unshared "retraction" left the coordinate live with no opt-in
+///   tag, which is not a true retraction — the team must fully disappear.
+///   A typed `team-catalog-auto-retracted` frontend notice names the team and
+///   reason so the owner is not left wondering why their share toggle changed.
 ///
 /// Deliberately not wired into `save_teams()`: that is a disk-store primitive
 /// with many callers (import, repair, cascade delete), and signing a relay
@@ -341,7 +341,7 @@ fn reconcile_team_catalog_heads(app: &tauri::AppHandle, keys: &nostr::Keys, db_p
         return;
     };
 
-    match reconcile_team_catalog_heads_at(&base_dir, keys, db_path) {
+    match reconcile_team_catalog_heads_at(app, &base_dir, keys, db_path) {
         Ok(0) => {}
         Ok(reconciled) => {
             eprintln!(
@@ -356,8 +356,28 @@ fn reconcile_team_catalog_heads(app: &tauri::AppHandle, keys: &nostr::Keys, db_p
 
 /// Core catalog reconcile, decoupled from the Tauri `AppHandle` for testing.
 ///
-/// Returns the number of heads (re)written — republished or retracted.
+/// Returns the number of heads (re)written — republished or tombstoned.
 fn reconcile_team_catalog_heads_at(
+    app: &tauri::AppHandle,
+    base_dir: &Path,
+    keys: &nostr::Keys,
+    db_path: &Path,
+) -> Result<u32, String> {
+    reconcile_team_catalog_heads_core(Some(app), base_dir, keys, db_path)
+}
+
+#[cfg(test)]
+pub(crate) fn reconcile_team_catalog_heads_at_for_test(
+    base_dir: &Path,
+    keys: &nostr::Keys,
+    db_path: &Path,
+) -> Result<u32, String> {
+    reconcile_team_catalog_heads_core(None, base_dir, keys, db_path)
+}
+
+/// Inner reconcile, `app` is `None` only in unit tests (no Tauri runtime).
+fn reconcile_team_catalog_heads_core(
+    app: Option<&tauri::AppHandle>,
     base_dir: &Path,
     keys: &nostr::Keys,
     db_path: &Path,
@@ -366,8 +386,7 @@ fn reconcile_team_catalog_heads_at(
         persona_events::monotonic_created_at,
         retention::{get_retained_events_by_kind, open_retention_db, retain_event, RetainedEvent},
         team_catalog::{
-            build_team_catalog_event, build_team_catalog_retraction, resolve_team_members,
-            tombstone_team_catalog_coordinate,
+            build_team_catalog_event, resolve_team_members, tombstone_team_catalog_coordinate,
         },
         TeamRecord,
     };
@@ -436,18 +455,38 @@ fn reconcile_team_catalog_heads_at(
         }
 
         // Reproject from the current on-disk team and members. A failure here
-        // is the retraction trigger, not an error to propagate: the owner's
-        // local edit already happened and cannot be undone from here.
+        // is the retraction trigger: purge + tombstone the coordinate and
+        // notify the owner via a typed frontend event (I4). The stale-body
+        // "retraction" pattern was replaced because an unshared-but-retained
+        // coordinate leaves the event live on the relay with no opt-in tag.
         let rebuilt = resolve_team_members(team, &personas)
             .and_then(|members| build_team_catalog_event(team, &members, true));
         let builder = match rebuilt {
             Ok(builder) => builder,
             Err(reason) => {
                 eprintln!(
-                    "buzz-desktop: team-catalog-reconcile: retracting '{}' — {reason}",
+                    "buzz-desktop: team-catalog-reconcile: tombstoning '{}' — {reason}",
                     team.name
                 );
-                build_team_catalog_retraction(&team.id, &head.content)?
+                // Close the read connection so the tombstone can open its own
+                // write connection without busy-waiting (WAL mode allows it,
+                // but explicit drop is cleaner for test isolation).
+                drop(conn);
+                if let Err(e) = tombstone_team_catalog_coordinate(db_path, keys, &team.id) {
+                    eprintln!(
+                        "buzz-desktop: team-catalog-reconcile: tombstone failed for '{}': {e}",
+                        team.name
+                    );
+                } else {
+                    reconciled += 1;
+                    if let Some(app) = app {
+                        emit_team_catalog_auto_retracted(app, &team.name, &reason);
+                    }
+                }
+                // conn was moved; we cannot continue the loop — return with
+                // what was reconciled so far. The next boot will pick up any
+                // remaining heads (all_heads was snapshotted before the loop).
+                return Ok(reconciled);
             }
         };
 
@@ -458,7 +497,7 @@ fn reconcile_team_catalog_heads_at(
             .sign_with_keys(keys)
             .map_err(|e| format!("failed to sign catalog head for '{}': {e}", team.name))?;
 
-        // Compare the tag too, not just the body: a retraction replays the
+        // Compare the tag too, not just the body: an unshare replays the
         // retained content verbatim, so bytes alone would report "unchanged"
         // and leave the stale head shared.
         if head.content == event.content && event_is_shared(&event) {
@@ -482,6 +521,29 @@ fn reconcile_team_catalog_heads_at(
     }
 
     Ok(reconciled)
+}
+
+/// Emit a typed Tauri event so the frontend can show the owner a notice when
+/// the boot reconcile automatically retracts a shared team.
+///
+/// Best-effort: a failed emit is logged but does not block reconcile.
+fn emit_team_catalog_auto_retracted(app: &tauri::AppHandle, team_name: &str, reason: &str) {
+    use serde::Serialize;
+    use tauri::Emitter;
+
+    #[derive(Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TeamCatalogAutoRetractedPayload<'a> {
+        team_name: &'a str,
+        reason: &'a str,
+    }
+
+    if let Err(e) = app.emit(
+        "team-catalog-auto-retracted",
+        TeamCatalogAutoRetractedPayload { team_name, reason },
+    ) {
+        eprintln!("buzz-desktop: team-catalog-reconcile: failed to emit retraction notice: {e}");
+    }
 }
 
 /// Read a JSON array store, treating an absent file as empty.

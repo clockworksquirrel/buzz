@@ -107,7 +107,11 @@ fn head(base_dir: &Path, keys: &nostr::Keys) -> Option<RetainedEvent> {
 }
 
 fn reconcile(base_dir: &Path, keys: &nostr::Keys) -> Result<u32, String> {
-    reconcile_team_catalog_heads_at(base_dir, keys, &base_dir.join("retention.db"))
+    crate::event_sync::reconcile_team_catalog_heads_at_for_test(
+        base_dir,
+        keys,
+        &base_dir.join("retention.db"),
+    )
 }
 
 fn head_is_shared(row: &RetainedEvent) -> bool {
@@ -152,31 +156,37 @@ fn test_unchanged_team_is_left_alone() {
 }
 
 #[test]
-fn test_deleted_member_retracts_the_head_without_deleting_it() {
+fn test_deleted_member_tombstones_the_coordinate() {
+    // I4: a member disappears making the team unrebuildable. The reconcile
+    // must purge+tombstone the coordinate (not retain a stale-body unshared
+    // head), and the tombstone must be queued for the flush loop.
     let base = tempfile::tempdir().unwrap();
     let keys = nostr::Keys::generate();
     retain_head(base.path(), &keys, &team(), &[member("m1", "Original.")]);
-    let before = head(base.path(), &keys).unwrap();
     // The member is gone, so the team can no longer be projected at all.
     write_stores(base.path(), &[team()], &[]);
 
     assert_eq!(reconcile(base.path(), &keys).unwrap(), 1);
 
-    let after = head(base.path(), &keys).unwrap();
+    // The 30178 row must be purged (not merely unshared).
     assert!(
-        !head_is_shared(&after),
-        "a team that can no longer be projected must stop being discoverable"
+        head(base.path(), &keys).is_none(),
+        "unrebuildable team must purge the 30178 row, not retain a stale-body unshared head"
     );
-    assert_eq!(
-        after.content, before.content,
-        "retraction replays the retained body so the owner can re-share it"
+
+    // A kind:5 tombstone must be queued.
+    let conn = open_retention_db(&base.path().join("retention.db")).unwrap();
+    let pending = crate::managed_agents::retention::get_pending_sync(&conn).unwrap();
+    assert!(
+        pending.iter().any(|row| row.kind == 5),
+        "a kind:5 tombstone must be queued after purge"
     );
-    assert!(after.pending_sync);
-    assert!(after.created_at > before.created_at);
 }
 
 #[test]
-fn test_retraction_is_not_repeated_on_the_next_boot() {
+fn test_tombstone_is_not_repeated_on_next_boot() {
+    // After the first boot tombstones the unrebuildable head (purging the 30178
+    // row), the next boot must see no 30178 head and do nothing.
     let base = tempfile::tempdir().unwrap();
     let keys = nostr::Keys::generate();
     retain_head(base.path(), &keys, &team(), &[member("m1", "Original.")]);
@@ -186,7 +196,7 @@ fn test_retraction_is_not_repeated_on_the_next_boot() {
     assert_eq!(
         reconcile(base.path(), &keys).unwrap(),
         0,
-        "the head is already untagged, so there is nothing left to retract"
+        "no 30178 head remains after tombstone, so nothing to do"
     );
 }
 
