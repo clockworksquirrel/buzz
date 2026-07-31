@@ -1011,6 +1011,24 @@ pub struct PromptProfile {
 /// Pubkey-keyed profile lookup used while formatting ACP prompts.
 pub type PromptProfileLookup = HashMap<String, PromptProfile>;
 
+/// Collect every profile-backed name that may appear in a leading Buzz
+/// mention. Control parsing and prompt slash-command parsing must use this
+/// same set so a multi-word mention cannot be interpreted differently at the
+/// two boundaries.
+pub fn profile_known_names(profile_lookup: Option<&PromptProfileLookup>) -> Vec<&str> {
+    profile_lookup
+        .into_iter()
+        .flat_map(|lookup| lookup.values())
+        .flat_map(|profile| {
+            [
+                profile.display_name.as_deref(),
+                profile.nip05_handle.as_deref(),
+            ]
+        })
+        .flatten()
+        .collect()
+}
+
 /// Normalize a pubkey for HashMap lookup (trim + lowercase). No validation —
 /// the key just needs to match what `parse_profile_lookup_response` stored.
 /// See also: `normalize_prompt_pubkey` in pool.rs (validates 64-char hex).

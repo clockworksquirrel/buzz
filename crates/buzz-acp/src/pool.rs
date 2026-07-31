@@ -102,6 +102,10 @@ pub struct SessionState {
     /// fetch fails — all fail open. Cleared on session invalidation alongside
     /// `core_sections` so the next session picks up any canvas change.
     pub canvas_sections: HashMap<Uuid, String>,
+    /// Channel-wide model-routing generation applied to this slot's child
+    /// session. A mismatched lease invalidates the slot-local session before
+    /// dispatch, keeping session scope coherent across parallel workers.
+    pub route_generations: HashMap<Uuid, u64>,
 }
 
 impl SessionState {
@@ -124,6 +128,7 @@ impl SessionState {
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
+        self.route_generations.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
 
@@ -135,6 +140,7 @@ impl SessionState {
         self.heartbeat_turn_count = 0;
         self.core_sections.clear();
         self.canvas_sections.clear();
+        self.route_generations.clear();
     }
 
     #[cfg(test)]
@@ -143,6 +149,7 @@ impl SessionState {
             || self.turn_counts.contains_key(channel_id)
             || self.core_sections.contains_key(channel_id)
             || self.canvas_sections.contains_key(channel_id)
+            || self.route_generations.contains_key(channel_id)
     }
 }
 
@@ -215,6 +222,7 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
+    route_leases: HashMap<tokio::task::Id, crate::model_route::TurnRouteLease>,
 }
 
 /// Result returned by a completed prompt task.
@@ -567,6 +575,7 @@ impl AgentPool {
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
+            route_leases: HashMap::new(),
         }
     }
 
@@ -640,6 +649,21 @@ impl AgentPool {
 
     pub fn task_map_mut(&mut self) -> &mut HashMap<tokio::task::Id, TaskMeta> {
         &mut self.task_map
+    }
+
+    pub fn set_route_lease(
+        &mut self,
+        task_id: tokio::task::Id,
+        lease: crate::model_route::TurnRouteLease,
+    ) {
+        self.route_leases.insert(task_id, lease);
+    }
+
+    pub fn take_route_lease(
+        &mut self,
+        task_id: tokio::task::Id,
+    ) -> Option<crate::model_route::TurnRouteLease> {
+        self.route_leases.remove(&task_id)
     }
 
     /// Try to send a goose-native steer request to the in-flight task for
@@ -1321,6 +1345,16 @@ fn send_prompt_result(
     });
 }
 
+/// Defense-in-depth boundary for model controls that escaped the read-loop
+/// interceptor. Such a control must never become LLM prompt content.
+fn contains_unconsumed_model_control(batch: &FlushBatch, known_names: &[&str]) -> bool {
+    batch.events.iter().any(|event| {
+        crate::queue::extract_slash_command(&event.event.content, known_names)
+            .map(|command| crate::model_route::parse_command(&command))
+            .is_some_and(|parsed| parsed != crate::model_route::CommandParse::NotModelCommand)
+    })
+}
+
 /// Core async function spawned for each prompt.
 ///
 /// Lifecycle:
@@ -1333,6 +1367,7 @@ fn send_prompt_result(
 ///
 /// The agent is ALWAYS returned — even on panic the `JoinSet` detects the
 /// abort and the caller uses `task_map` to recover the agent index.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_prompt_task(
     mut agent: OwnedAgent,
     batch: Option<FlushBatch>,
@@ -1341,6 +1376,7 @@ pub async fn run_prompt_task(
     result_tx: mpsc::UnboundedSender<PromptResult>,
     control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
     turn_id: String,
+    route_lease: Option<crate::model_route::TurnRouteLease>,
 ) {
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
@@ -1420,6 +1456,38 @@ pub async fn run_prompt_task(
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
         .unwrap_or_default();
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
+
+    // A route lease is reserved by the single-threaded harness main loop only
+    // after an agent slot is claimed. When this slot has not yet joined the
+    // lease's channel-wide generation, invalidate any old child session and
+    // arm the Pinchpoint ACP adapter before `session/new`. The adapter consumes
+    // this private extension once; no model command or credential enters the
+    // model prompt.
+    let mut route_generation_to_commit: Option<(Uuid, u64)> = None;
+    if let (PromptSource::Channel(cid), Some(lease)) = (&source, route_lease.as_ref()) {
+        let applied = agent.state.route_generations.get(cid).copied();
+        if applied != Some(lease.generation_id) {
+            agent.state.invalidate_channel(cid);
+            agent.desired_model = Some(lease.model_id().to_string());
+            agent.model_overridden = lease.explicit;
+            if let Err(error) = agent
+                .acp
+                .pinchpoint_route_arm(lease.generation_id, lease.model_id(), lease.explicit)
+                .await
+            {
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(error),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
+            route_generation_to_commit = Some((*cid, lease.generation_id));
+        }
+    }
 
     //
     // Core memory is delivered inside the system prompt the harness already
@@ -1547,6 +1615,9 @@ pub async fn run_prompt_task(
                 // agent in several channels doesn't produce identical session
                 // rows; `title_channel` comes from the single resolve above and
                 // is `None` for DM, unresolved, and unnamed channels.
+                if let Some(lease) = route_lease.as_ref() {
+                    lease.mark_attempt_started();
+                }
                 match create_session_and_apply_model(
                     &mut agent,
                     &ctx,
@@ -1562,6 +1633,9 @@ pub async fn run_prompt_task(
                             "created session {sid} for channel {cid}"
                         );
                         agent.state.sessions.insert(*cid, sid.clone());
+                        if let Some((route_cid, generation)) = route_generation_to_commit.take() {
+                            agent.state.route_generations.insert(route_cid, generation);
+                        }
                         // Commit canvas only after session creation succeeds (I3).
                         if let Some((pending_cid, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_cid, section);
@@ -1657,6 +1731,9 @@ pub async fn run_prompt_task(
     if is_new_session {
         if let (PromptSource::Channel(cid), Some(ref initial_msg)) = (&source, &ctx.initial_message)
         {
+            if let Some(lease) = route_lease.as_ref() {
+                lease.mark_attempt_started();
+            }
             tracing::info!(
                 target: "pool::session",
                 "sending initial_message to session {session_id} for channel {cid}"
@@ -1829,13 +1906,65 @@ pub async fn run_prompt_task(
         let profile_lookup =
             fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
 
-        let known_names: Vec<&str> = profile_lookup
-            .iter()
-            .flat_map(|lookup| lookup.values())
-            .flat_map(|p| [p.display_name.as_deref(), p.nip05_handle.as_deref()])
-            .flatten()
-            .collect();
-        slash_command = crate::queue::slash_command_for_batch(b, &known_names);
+        let known_names = crate::queue::profile_known_names(profile_lookup.as_ref());
+        let mut inline_batch = None;
+        let prompt_batch = if let Some((lease, event_index)) =
+            route_lease.as_ref().and_then(|lease| {
+                let source_event_id = lease.source_event_id.as_deref()?;
+                let event_index = b
+                    .events
+                    .iter()
+                    .position(|event| event.event.id.to_hex() == source_event_id)?;
+                lease.inline_prompt.as_ref()?;
+                Some((lease, event_index))
+            }) {
+            let mut replacement = b.clone();
+            replacement.events[event_index].event.content =
+                lease.inline_prompt.clone().unwrap_or_default();
+            inline_batch = Some(replacement);
+            inline_batch.as_ref().unwrap_or(b)
+        } else {
+            b
+        };
+        if contains_unconsumed_model_control(prompt_batch, &known_names) {
+            tracing::error!(
+                channel = %b.channel_id,
+                "unconsumed model-route control blocked at prompt boundary"
+            );
+            let thread_tags = prompt_batch
+                .events
+                .last()
+                .map(|event| crate::queue::parse_thread_tags(&event.event))
+                .unwrap_or_default();
+            post_failure_notice(
+                &ctx.rest_client,
+                b.channel_id,
+                &thread_tags,
+                "⚠️ I couldn't safely interpret that model command, so it was not sent to the agent. Please send it again.",
+            )
+            .await;
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::Error(AcpError::AgentError {
+                    code: -32044,
+                    message:
+                        "PINCHPOINT_TERMINAL_NO_RETRY: unconsumed model control blocked before prompt"
+                            .to_string(),
+                }),
+                batch.clone(),
+            );
+            return;
+        }
+        // An accepted inline `/model ... -- <prompt>` control is rendered as
+        // only the prompt body. The signed control text never reaches the LLM.
+        slash_command = if inline_batch.is_some() {
+            None
+        } else {
+            crate::queue::slash_command_for_batch(b, &known_names)
+        };
         if let Some(ref cmd) = slash_command {
             tracing::info!(
                 target: "pool::prompt",
@@ -1846,7 +1975,7 @@ pub async fn run_prompt_task(
         }
 
         crate::queue::format_prompt(
-            b,
+            prompt_batch,
             &crate::queue::FormatPromptArgs {
                 agent_core: agent_core.as_deref(),
                 channel_info: channel_info.as_ref(),
@@ -1901,6 +2030,9 @@ pub async fn run_prompt_task(
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
+    if let Some(lease) = route_lease.as_ref() {
+        lease.mark_attempt_started();
+    }
     let prompt_result = match control_rx {
         None => {
             // Heartbeat / non-cancellable path.
@@ -2646,6 +2778,19 @@ fn collect_prompt_pubkeys(
     pubkeys
 }
 
+fn collect_event_pubkeys(event: &nostr::Event) -> Vec<String> {
+    let mut pubkeys = HashSet::new();
+    pubkeys.insert(event.pubkey.to_hex().to_ascii_lowercase());
+    for mentioned in crate::queue::parse_thread_tags(event).mentioned_pubkeys {
+        if let Some(normalized) = normalize_prompt_pubkey(&mentioned) {
+            pubkeys.insert(normalized);
+        }
+    }
+    let mut pubkeys: Vec<String> = pubkeys.into_iter().collect();
+    pubkeys.sort();
+    pubkeys
+}
+
 /// Detect whether a kind:0 profile event belongs to an owned agent.
 ///
 /// Agents carry a NIP-OA `["auth", owner_pk, conditions, sig]` tag in their
@@ -2706,12 +2851,10 @@ fn parse_kind0_profile_lookup(json: serde_json::Value) -> Option<PromptProfileLo
     }
 }
 
-async fn fetch_prompt_profile_lookup(
-    batch: &FlushBatch,
-    conversation_context: Option<&ConversationContext>,
+async fn fetch_profile_lookup_for_pubkeys(
+    pubkeys: Vec<String>,
     rest: &RestClient,
 ) -> Option<PromptProfileLookup> {
-    let pubkeys = collect_prompt_pubkeys(batch, conversation_context);
     if pubkeys.is_empty() {
         return None;
     }
@@ -2747,6 +2890,26 @@ async fn fetch_prompt_profile_lookup(
         }
     })
     .await
+}
+
+async fn fetch_prompt_profile_lookup(
+    batch: &FlushBatch,
+    conversation_context: Option<&ConversationContext>,
+    rest: &RestClient,
+) -> Option<PromptProfileLookup> {
+    fetch_profile_lookup_for_pubkeys(collect_prompt_pubkeys(batch, conversation_context), rest)
+        .await
+}
+
+/// Resolve the author and tagged mentions for an inbound control candidate.
+///
+/// The read loop uses this before queueing `/model` controls so it recognizes
+/// the same multi-word display names as the later prompt path.
+pub(crate) async fn fetch_event_profile_lookup(
+    event: &nostr::Event,
+    rest: &RestClient,
+) -> Option<PromptProfileLookup> {
+    fetch_profile_lookup_for_pubkeys(collect_event_pubkeys(event), rest).await
 }
 
 /// Fetch thread context via Nostr query: root event by ID + replies by `#e` tag.
@@ -4227,6 +4390,47 @@ mod tests {
         expected.sort();
 
         assert_eq!(pubkeys, expected);
+    }
+
+    #[test]
+    fn unconsumed_multi_word_model_control_is_blocked_before_prompt() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "@Dawn Smith /model use opus5 --for turn")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        assert!(contains_unconsumed_model_control(&batch, &["Dawn Smith"]));
+        assert!(!contains_unconsumed_model_control(&batch, &["Dawn"]));
+    }
+
+    #[test]
+    fn accepted_inline_replacement_is_not_blocked_as_control() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "summarize this safely")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        assert!(!contains_unconsumed_model_control(&batch, &["Dawn Smith"]));
     }
 
     #[test]

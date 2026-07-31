@@ -4,6 +4,7 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod model_route;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -35,6 +36,7 @@ use config::{
 };
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
+use model_route::{ControlResult as ModelControlResult, ModelRouteController};
 use nostr::{PublicKey, ToBech32};
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
@@ -46,6 +48,72 @@ use relay::{HarnessRelay, RelayEventPublisher};
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+fn parse_model_command_with_profiles(
+    content: &str,
+    profile_lookup: Option<&queue::PromptProfileLookup>,
+    configured_display_name: Option<&str>,
+) -> model_route::CommandParse {
+    let mut known_names = queue::profile_known_names(profile_lookup);
+    if let Some(display_name) = configured_display_name.filter(|name| !name.trim().is_empty()) {
+        known_names.push(display_name);
+    }
+    queue::extract_slash_command(content, &known_names)
+        .map(|command| model_route::parse_command(&command))
+        .unwrap_or(model_route::CommandParse::NotModelCommand)
+}
+
+async fn parse_inbound_model_command(
+    event: &nostr::Event,
+    rest_client: &relay::RestClient,
+) -> model_route::CommandParse {
+    let configured_display_name = std::env::var("BUZZ_ACP_DISPLAY_NAME").ok();
+    let first_pass =
+        parse_model_command_with_profiles(&event.content, None, configured_display_name.as_deref());
+    if first_pass != model_route::CommandParse::NotModelCommand || !event.content.contains("/model")
+    {
+        return first_pass;
+    }
+
+    let profile_lookup = pool::fetch_event_profile_lookup(event, rest_client).await;
+    parse_model_command_with_profiles(
+        &event.content,
+        profile_lookup.as_ref(),
+        configured_display_name.as_deref(),
+    )
+}
+
+fn publish_model_control_result(
+    observer: Option<&observer::ObserverHandle>,
+    rest_client: &relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: ThreadTags,
+    result: ModelControlResult,
+) {
+    if let Some(observer) = observer {
+        observer.emit(
+            "control_result",
+            None,
+            &observer::ObserverContext {
+                channel_id: Some(channel_id.to_string()),
+                session_id: None,
+                turn_id: None,
+                started_at: None,
+            },
+            serde_json::to_value(&result).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "type": "model_route",
+                    "action": "invalid",
+                    "status": "rejected",
+                })
+            }),
+        );
+    }
+    let rest = rest_client.clone();
+    tokio::spawn(async move {
+        pool::post_failure_notice(&rest, channel_id, &thread_tags, result.message.as_str()).await;
+    });
+}
 
 /// Check if argv[1] matches a subcommand name, before any clap parsing.
 ///
@@ -1502,6 +1570,7 @@ async fn tokio_main() -> Result<()> {
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    let mut model_routes = ModelRouteController::new(&pubkey_hex, &config.relay_url);
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -1704,6 +1773,23 @@ async fn tokio_main() -> Result<()> {
     }
 
     loop {
+        // UTC is the authoritative expiry clock. The timer arm below is only
+        // a wake-up; every loop re-reads UTC so suspend/resume and clock steps
+        // expire immediately or reschedule without trusting elapsed time.
+        for (channel_id, result, invalidate_sessions) in model_routes.expire_due(chrono::Utc::now())
+        {
+            if invalidate_sessions {
+                pool.invalidate_channel_sessions(channel_id);
+            }
+            publish_model_control_result(
+                observer.as_ref(),
+                &ctx.rest_client,
+                channel_id,
+                ThreadTags::default(),
+                result,
+            );
+        }
+
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -1774,7 +1860,9 @@ async fn tokio_main() -> Result<()> {
             // called on relay events or pool results, neither of which
             // arrive when the channel is silent.
             if queue.has_flushable_work() {
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut model_routes)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -1810,16 +1898,25 @@ async fn tokio_main() -> Result<()> {
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
-            for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+            for (channel_id, thread_tags) in
+                dispatch_pending(&mut pool, &mut queue, &ctx, &mut model_routes)
+            {
                 typing_channels.insert(channel_id, thread_tags);
             }
         }
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
+        let route_expiry_delay = model_routes.next_expiry_delay(chrono::Utc::now());
         let pool_event: Option<PoolEvent> = {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
                 biased;
+                _ = async move {
+                    match route_expiry_delay {
+                        Some(delay) => tokio::time::sleep(delay).await,
+                        None => std::future::pending().await,
+                    }
+                } => None,
                 // recv() returning None means all senders dropped (pool was torn down).
                 // Break cleanly instead of panicking.
                 r = result_rx.recv(), if pool_ready => match r {
@@ -1995,6 +2092,7 @@ async fn tokio_main() -> Result<()> {
                                     // Track removed channels so checked-out agents get
                                     // their sessions stripped when they return to the pool.
                                     removed_channels.insert(ch);
+                                    model_routes.clear_channel(ch);
                                     typing_channels.remove(&ch);
                                     // Best-effort: clean up 👀 on drained events.
                                     // Note: the relay revokes membership before
@@ -2107,6 +2205,10 @@ async fn tokio_main() -> Result<()> {
                             if is_rotate {
                                 if let Some(owner) = owner_cache.get() {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        let ended_model_session =
+                                            model_routes.end_session_scope(
+                                                buzz_event.channel_id,
+                                            );
                                         let fired = signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
@@ -2115,6 +2217,7 @@ async fn tokio_main() -> Result<()> {
                                         if fired {
                                             tracing::info!(
                                                 channel_id = %buzz_event.channel_id,
+                                                ended_model_session,
                                                 "!rotate received — cancelling in-flight turn and rotating session"
                                             );
                                         } else {
@@ -2122,6 +2225,7 @@ async fn tokio_main() -> Result<()> {
                                             tracing::info!(
                                                 channel_id = %buzz_event.channel_id,
                                                 invalidated,
+                                                ended_model_session,
                                                 "!rotate received — invalidated idle channel session(s)"
                                             );
                                         }
@@ -2178,6 +2282,67 @@ async fn tokio_main() -> Result<()> {
                                     continue;
                                 }
                             };
+
+                            // Owner-directed model routing is a harness control
+                            // plane, never an LLM instruction. Recognition is
+                            // intentionally after the normal subscription rule
+                            // (so the event must address this agent) and before
+                            // queue.push() (so controls cannot enter a prompt).
+                            let parsed_model_command = parse_inbound_model_command(
+                                &buzz_event.event,
+                                &ctx.rest_client,
+                            )
+                            .await;
+                            if parsed_model_command
+                                != model_route::CommandParse::NotModelCommand
+                            {
+                                if let Err(error) =
+                                    buzz_core::verify_event(&buzz_event.event)
+                                {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "model-route control failed signature verification"
+                                    );
+                                    continue;
+                                }
+                                let channel_id = buzz_event.channel_id;
+                                let thread_tags =
+                                    queue::parse_thread_tags(&buzz_event.event);
+                                let sender = buzz_event.event.pubkey.to_hex();
+                                let event_id = buzz_event.event.id.to_hex();
+                                let owner = owner_cache.get().unwrap_or("");
+                                if let Some(outcome) = model_routes.handle(
+                                    channel_id,
+                                    parsed_model_command,
+                                    &sender,
+                                    owner,
+                                    &event_id,
+                                    buzz_event.event.created_at.as_secs(),
+                                    chrono::Utc::now(),
+                                ) {
+                                    if outcome.invalidate_sessions {
+                                        let invalidated =
+                                            pool.invalidate_channel_sessions(channel_id);
+                                        tracing::info!(
+                                            %channel_id,
+                                            invalidated,
+                                            "model-route generation invalidated idle sessions"
+                                        );
+                                    }
+                                    publish_model_control_result(
+                                        observer.as_ref(),
+                                        &ctx.rest_client,
+                                        channel_id,
+                                        thread_tags,
+                                        outcome.result,
+                                    );
+                                    if outcome.consume {
+                                        continue;
+                                    }
+                                    debug_assert!(outcome.queue_inline_turn);
+                                }
+                            }
+
                             // Capture author pubkey before queue.push() moves
                             // buzz_event.event (needed for mode gate below).
                             let author_hex = buzz_event.event.pubkey.to_hex();
@@ -2258,7 +2423,12 @@ async fn tokio_main() -> Result<()> {
                             }
                             if pool_ready {
                                 for (channel_id, thread_tags) in
-                                    dispatch_pending(&mut pool, &mut queue, &ctx)
+                                    dispatch_pending(
+                                        &mut pool,
+                                        &mut queue,
+                                        &ctx,
+                                        &mut model_routes,
+                                    )
                                 {
                                     typing_channels.insert(channel_id, thread_tags);
                                 }
@@ -2287,7 +2457,12 @@ async fn tokio_main() -> Result<()> {
                     } else if queue.has_flushable_work() {
                         tracing::debug!("heartbeat_skipped_events");
                         for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx)
+                            dispatch_pending(
+                                &mut pool,
+                                &mut queue,
+                                &ctx,
+                                &mut model_routes,
+                            )
                         {
                             typing_channels.insert(channel_id, thread_tags);
                         }
@@ -2354,9 +2529,10 @@ async fn tokio_main() -> Result<()> {
                 if let PromptSource::Channel(ch) = &result.source {
                     typing_channels.remove(ch);
                 }
-                if handle_prompt_result(
+                if handle_prompt_result_with_routes(
                     &mut pool,
                     &mut queue,
+                    &mut model_routes,
                     &config,
                     *result,
                     &mut heartbeat_in_flight,
@@ -2373,6 +2549,7 @@ async fn tokio_main() -> Result<()> {
                 if drain_ready_join_results(
                     &mut pool,
                     &mut queue,
+                    &mut model_routes,
                     &config,
                     &mut heartbeat_in_flight,
                     &removed_channels,
@@ -2381,19 +2558,23 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
+                    Some(&ctx.rest_client),
                 ) == LoopAction::Exit
                 {
                     break;
                 }
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut model_routes)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
             Some(PoolEvent::Panic(join_error)) => {
                 tracing::error!("agent task panicked: {join_error}");
-                recover_panicked_agent(
+                recover_panicked_agent_with_routes(
                     &mut pool,
                     &mut queue,
+                    &mut model_routes,
                     &config,
                     join_error,
                     &mut heartbeat_in_flight,
@@ -2403,12 +2584,15 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
+                    Some(&ctx.rest_client),
                 );
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut model_routes)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -2550,7 +2734,9 @@ async fn tokio_main() -> Result<()> {
                 // tear down the in-flight task; on its completion the
                 // queue drains. We still try here in case the in-flight
                 // task has already returned.
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut model_routes)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -2577,7 +2763,7 @@ async fn tokio_main() -> Result<()> {
                             None,
                         );
                         for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx)
+                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut model_routes)
                         {
                             typing_channels.insert(channel_id, thread_tags);
                         }
@@ -2906,11 +3092,26 @@ fn try_native_steer(
 
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
+/// Only routing-enabled harnesses may expose a lease to the prompt task.
+///
+/// The main loop keeps the lease itself for queue/retry ownership even while
+/// routing is disabled, but withholding it here makes every private route-arm
+/// and route-observer seam unreachable for unrelated ACP children.
+fn route_lease_for_prompt(
+    model_routes: &ModelRouteController,
+    lease: &model_route::TurnRouteLease,
+) -> Option<model_route::TurnRouteLease> {
+    model_routes
+        .private_extension_enabled()
+        .then(|| lease.clone())
+}
+
 /// Flush queued work to available agents.
 fn dispatch_pending(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     ctx: &Arc<PromptContext>,
+    model_routes: &mut ModelRouteController,
 ) -> Vec<(Uuid, ThreadTags)> {
     let mut dispatched_channels = Vec::new();
     loop {
@@ -2945,6 +3146,22 @@ fn dispatch_pending(
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
         let agent_index = agent.index;
+        let proposed_turn_id = Uuid::new_v4().to_string();
+        let route = model_routes.acquire(channel_id, proposed_turn_id);
+        tracing::debug!(
+            channel_id = %channel_id,
+            route_state = ?route.kind,
+            "model route lease acquisition"
+        );
+        let Some(route_lease) = route.lease else {
+            pool.return_agent(agent);
+            queue.requeue_preserve_timestamps(batch);
+            queue.mark_complete(channel_id);
+            break;
+        };
+        // A queue retry receives the same immutable routing lease and logical
+        // turn ID even if the prior attempt used another pool slot.
+        let turn_id = route_lease.logical_turn_id.clone();
 
         // Mid-turn non-cancelling steer seam: install the per-turn steer
         // receiver on the read loop so the main loop's mode-gate fork
@@ -2962,8 +3179,8 @@ fn dispatch_pending(
         // Prompt text is now built inside run_prompt_task (needs async for
         // context fetching). Pass None for prompt_text; batch carries the data.
         let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
-        let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
+        let task_route_lease = route_lease_for_prompt(model_routes, &route_lease);
 
         let abort_handle = pool.join_set.spawn(async move {
             pool::run_prompt_task(
@@ -2974,12 +3191,15 @@ fn dispatch_pending(
                 result_tx,
                 Some(control_rx),
                 task_turn_id,
+                task_route_lease,
             )
             .await;
         });
 
+        let task_id = abort_handle.id();
+        pool.set_route_lease(task_id, route_lease);
         pool.task_map_mut().insert(
-            abort_handle.id(),
+            task_id,
             pool::TaskMeta {
                 agent_index,
                 channel_id: Some(channel_id),
@@ -2997,6 +3217,114 @@ fn dispatch_pending(
         "dispatch_pending"
     );
     dispatched_channels
+}
+
+#[cfg(test)]
+mod model_route_harness_gate_tests {
+    use super::*;
+
+    fn controller(routing_enabled: bool) -> ModelRouteController {
+        let path = std::env::temp_dir().join(format!(
+            "buzz-model-route-harness-gate-test-{}-{}.json",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        ModelRouteController::with_ledger_path_and_routing(
+            "test-agent",
+            path,
+            routing_enabled,
+            false,
+        )
+    }
+
+    #[test]
+    fn disabled_harness_keeps_queue_lease_private_from_prompt_task() {
+        let mut routes = controller(false);
+        let channel_id = Uuid::new_v4();
+        let lease = routes
+            .acquire(channel_id, "disabled-normal-turn".to_string())
+            .lease
+            .expect("ordinary queue ownership still receives a lease");
+
+        assert!(!routes.private_extension_enabled());
+        assert!(
+            route_lease_for_prompt(&routes, &lease).is_none(),
+            "disabled routing must make _pinchpoint/route/arm unreachable"
+        );
+    }
+
+    #[test]
+    fn enabled_harness_forwards_lease_to_private_router_boundary() {
+        let mut routes = controller(true);
+        let channel_id = Uuid::new_v4();
+        let lease = routes
+            .acquire(channel_id, "enabled-normal-turn".to_string())
+            .lease
+            .expect("enabled routing receives a route lease");
+
+        assert!(routes.private_extension_enabled());
+        assert!(
+            route_lease_for_prompt(&routes, &lease).is_some(),
+            "enabled routing must forward the lease for route arming"
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_control_interception_tests {
+    use super::*;
+
+    #[test]
+    fn profile_backed_multi_word_mention_reaches_control_parser() {
+        let mut profiles = queue::PromptProfileLookup::new();
+        profiles.insert(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            queue::PromptProfile {
+                display_name: Some("Dawn Smith".into()),
+                nip05_handle: None,
+                is_agent: true,
+            },
+        );
+
+        let parsed = parse_model_command_with_profiles(
+            "@Dawn Smith /model use opus5 --for turn",
+            Some(&profiles),
+            None,
+        );
+        assert!(matches!(
+            parsed,
+            model_route::CommandParse::Valid(model_route::ModelCommand::Use {
+                target: model_route::ModelTarget::Opus5,
+                scope: model_route::ParsedScope::Turn,
+                inline_prompt: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn configured_multi_word_name_is_available_before_profile_fetch() {
+        let parsed = parse_model_command_with_profiles(
+            "@Dawn Smith /model status",
+            None,
+            Some("Dawn Smith"),
+        );
+        assert!(matches!(
+            parsed,
+            model_route::CommandParse::Valid(model_route::ModelCommand::Status)
+        ));
+    }
+
+    #[test]
+    fn non_model_slash_command_stays_outside_control_plane() {
+        assert_eq!(
+            parse_model_command_with_profiles(
+                "@Dawn Smith /goal ship it",
+                None,
+                Some("Dawn Smith")
+            ),
+            model_route::CommandParse::NotModelCommand
+        );
+    }
 }
 
 /// Returns `true` when `error` is a non-retryable authentication failure.
@@ -3028,6 +3356,18 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
     message.contains("Re-authenticate") || message.contains("API Error: 401")
 }
 
+/// The Pinchpoint ACP router marks a default-route failure as terminal after
+/// visible output/side effects, on an ineligible failure, or after the fixed
+/// candidate chain is exhausted. Requeueing would either duplicate work or
+/// escape the precomputed one-logical-turn route.
+fn is_terminal_route_failure(error: &acp::AcpError) -> bool {
+    let acp::AcpError::AgentError { message, .. } = error else {
+        return false;
+    };
+    message.contains("PINCHPOINT_TERMINAL_AFTER_EFFECT:")
+        || message.contains("PINCHPOINT_TERMINAL_NO_RETRY:")
+}
+
 /// Spawn a task that posts a user-visible failure notice to the relay.
 ///
 /// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
@@ -3051,10 +3391,48 @@ fn spawn_failure_notice(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn handle_prompt_result(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
+    config: &Config,
+    result: PromptResult,
+    heartbeat_in_flight: &mut bool,
+    removed_channels: &HashSet<Uuid>,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+    rest_client: Option<&relay::RestClient>,
+) -> LoopAction {
+    let path = std::env::temp_dir().join(format!(
+        "buzz-model-route-result-test-{}-{}.json",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let mut model_routes = ModelRouteController::with_ledger_path("test-agent", path, false);
+    handle_prompt_result_with_routes(
+        pool,
+        queue,
+        &mut model_routes,
+        config,
+        result,
+        heartbeat_in_flight,
+        removed_channels,
+        crash_history,
+        respawn_tx,
+        respawn_tasks,
+        observer,
+        rest_client,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_prompt_result_with_routes(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    model_routes: &mut ModelRouteController,
     config: &Config,
     mut result: PromptResult,
     heartbeat_in_flight: &mut bool,
@@ -3067,9 +3445,56 @@ fn handle_prompt_result(
 ) -> LoopAction {
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
+    let task_id = pool
+        .task_map()
+        .iter()
+        .find_map(|(task_id, meta)| (meta.agent_index == agent_index).then_some(*task_id));
+    let route_lease = task_id.and_then(|task_id| pool.take_route_lease(task_id));
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
+
+    let strict_backend_failure = route_lease.as_ref().is_some_and(|lease| {
+        lease.explicit
+            && lease.attempt_started()
+            && matches!(
+                result.outcome,
+                PromptOutcome::Error(_) | PromptOutcome::AgentExited | PromptOutcome::Timeout(_)
+            )
+    });
+    let terminal_route_failure = matches!(
+        &result.outcome,
+        PromptOutcome::Error(error) if is_terminal_route_failure(error)
+    );
+    let strict_route_cancel = route_lease.as_ref().is_some_and(|lease| {
+        lease.explicit
+            && lease.attempt_started()
+            && matches!(
+                result.outcome,
+                PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
+            )
+    });
+    if strict_backend_failure {
+        if let (Some(rest), PromptSource::Channel(channel_id), Some(lease)) =
+            (rest_client, &result.source, route_lease.as_ref())
+        {
+            let thread_tags = result
+                .batch
+                .as_ref()
+                .and_then(|batch| batch.events.last())
+                .map(|event| queue::parse_thread_tags(&event.event))
+                .unwrap_or_default();
+            let rest = rest.clone();
+            let channel_id = *channel_id;
+            let message = format!(
+                "{} could not run this turn; no other model was used.",
+                lease.display_name()
+            );
+            tokio::spawn(async move {
+                pool::post_failure_notice(&rest, channel_id, &thread_tags, &message).await;
+            });
+        }
+    }
 
     // The hard-timeout death_message (below) must describe the batch's
     // *actual* fate, not just the `recently_active` eligibility flag — a
@@ -3079,6 +3504,7 @@ fn handle_prompt_result(
     // branch below records what actually happened; only the hard-timeout
     // match arm in the death_message construction reads it.
     let mut hard_timeout_fate_suffix: Option<&'static str> = None;
+    let mut preserve_route_lease = false;
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
@@ -3089,7 +3515,19 @@ fn handle_prompt_result(
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if matches!(
+            if strict_backend_failure || terminal_route_failure {
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    strict = strict_backend_failure,
+                    router_terminal = terminal_route_failure,
+                    "model route failure is terminal — batch not requeued"
+                );
+            } else if strict_route_cancel {
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    "cancelled strict model turn is terminal — original batch not requeued"
+                );
+            } else if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
@@ -3147,6 +3585,7 @@ fn handle_prompt_result(
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
+                    preserve_route_lease = true;
                 }
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // Auth errors are non-retryable: the token won't self-repair
@@ -3163,20 +3602,29 @@ fn handle_prompt_result(
                     and then re-send."
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
-            } else if let Some(dead) = queue.requeue(batch) {
-                let reason = match &result.outcome {
-                    PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
-                    PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
-                        "the turn exceeded the maximum duration".to_string()
+            } else {
+                match queue.requeue(batch) {
+                    Some(dead) => {
+                        let reason = match &result.outcome {
+                            PromptOutcome::Timeout(TimeoutKind::Idle) => {
+                                "the turn timed out".to_string()
+                            }
+                            PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
+                                "the turn exceeded the maximum duration".to_string()
+                            }
+                            PromptOutcome::AgentExited => "the agent process exited".to_string(),
+                            PromptOutcome::Error(e) => format!("{e}"),
+                            _ => "repeated failures".to_string(),
+                        };
+                        let content = format!(
+                            "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
+                        );
+                        spawn_failure_notice(rest_client, &dead, content);
                     }
-                    PromptOutcome::AgentExited => "the agent process exited".to_string(),
-                    PromptOutcome::Error(e) => format!("{e}"),
-                    _ => "repeated failures".to_string(),
-                };
-                let content = format!(
-                    "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
-                );
-                spawn_failure_notice(rest_client, &dead, content);
+                    None => {
+                        preserve_route_lease = true;
+                    }
+                }
             }
         } else {
             tracing::debug!(
@@ -3185,6 +3633,36 @@ fn handle_prompt_result(
                 "dropping failed batch for removed channel"
             );
             hard_timeout_fate_suffix = Some(" — batch dropped (channel removed)");
+        }
+    }
+
+    if let (PromptSource::Channel(channel_id), Some(lease)) = (&result.source, route_lease.as_ref())
+    {
+        if preserve_route_lease {
+            if !model_routes.preserve_for_retry(*channel_id, &lease.logical_turn_id) {
+                tracing::error!(
+                    channel_id = %channel_id,
+                    logical_turn_id = %lease.logical_turn_id,
+                    "failed to reserve model route lease for committed queue retry"
+                );
+            }
+        } else {
+            let completion = model_routes.finish(*channel_id, &lease.logical_turn_id);
+            if completion.invalidate_sessions {
+                result.agent.state.invalidate_channel(channel_id);
+                pool.invalidate_channel_sessions(*channel_id);
+            }
+            if let Some(rest) = rest_client {
+                for lifecycle in completion.lifecycle {
+                    publish_model_control_result(
+                        observer.as_ref(),
+                        rest,
+                        *channel_id,
+                        ThreadTags::default(),
+                        lifecycle,
+                    );
+                }
+            }
         }
     }
 
@@ -3419,6 +3897,7 @@ fn handle_prompt_result(
     LoopAction::Continue
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn recover_panicked_agent(
     pool: &mut AgentPool,
@@ -3433,21 +3912,96 @@ fn recover_panicked_agent(
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
 ) {
+    let path = std::env::temp_dir().join(format!(
+        "buzz-model-route-panic-test-{}-{}.json",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let mut model_routes = ModelRouteController::with_ledger_path("test-agent", path, false);
+    recover_panicked_agent_with_routes(
+        pool,
+        queue,
+        &mut model_routes,
+        config,
+        join_error,
+        heartbeat_in_flight,
+        removed_channels,
+        typing_channels,
+        crash_history,
+        respawn_tx,
+        respawn_tasks,
+        observer,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_panicked_agent_with_routes(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    model_routes: &mut ModelRouteController,
+    config: &Config,
+    join_error: tokio::task::JoinError,
+    heartbeat_in_flight: &mut bool,
+    removed_channels: &HashSet<Uuid>,
+    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+    rest_client: Option<&relay::RestClient>,
+) {
     let task_id = join_error.id();
+    let route_lease = pool.take_route_lease(task_id);
     let Some(meta) = pool.task_map_mut().remove(&task_id) else {
         tracing::error!("panic for unknown task {task_id:?} — bug");
         return;
     };
     let i = meta.agent_index;
+    let strict_backend_failure = route_lease
+        .as_ref()
+        .is_some_and(|lease| lease.explicit && lease.attempt_started());
+
+    if strict_backend_failure {
+        if let (Some(rest), Some(channel_id), Some(lease)) =
+            (rest_client, meta.channel_id, route_lease.as_ref())
+        {
+            let thread_tags = meta
+                .recoverable_batch
+                .as_ref()
+                .and_then(|batch| batch.events.last())
+                .map(|event| queue::parse_thread_tags(&event.event))
+                .unwrap_or_default();
+            let rest = rest.clone();
+            let message = format!(
+                "{} could not run this turn; no other model was used.",
+                lease.display_name()
+            );
+            tokio::spawn(async move {
+                pool::post_failure_notice(&rest, channel_id, &thread_tags, &message).await;
+            });
+        }
+    }
+
+    let mut preserve_route_lease = false;
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
         if let Some(ch) = meta.channel_id {
             if !removed_channels.contains(&ch) {
-                // Dead-letter on exhaustion is logged inside requeue(); a
-                // panic path has no outcome to report, so no notice here.
-                let _ = queue.requeue(batch);
-                tracing::warn!("requeued batch for panicked agent {i}");
+                if strict_backend_failure {
+                    tracing::warn!(
+                        channel_id = %ch,
+                        "strict explicit route panicked after backend attempt — terminal, not requeued"
+                    );
+                } else {
+                    // Dead-letter on exhaustion is logged inside requeue(); a
+                    // panic path has no outcome to report, so no notice here.
+                    if queue.requeue(batch).is_none() {
+                        preserve_route_lease = true;
+                        tracing::warn!("requeued batch for panicked agent {i}");
+                    }
+                }
             } else {
                 tracing::debug!(
                     channel_id = %ch,
@@ -3458,6 +4012,33 @@ fn recover_panicked_agent(
     }
 
     if let Some(ch) = meta.channel_id {
+        if let Some(lease) = route_lease.as_ref() {
+            if preserve_route_lease {
+                if !model_routes.preserve_for_retry(ch, &lease.logical_turn_id) {
+                    tracing::error!(
+                        channel_id = %ch,
+                        logical_turn_id = %lease.logical_turn_id,
+                        "failed to reserve panicked model route lease for queue retry"
+                    );
+                }
+            } else {
+                let completion = model_routes.finish(ch, &lease.logical_turn_id);
+                if completion.invalidate_sessions {
+                    pool.invalidate_channel_sessions(ch);
+                }
+                if let Some(rest) = rest_client {
+                    for lifecycle in completion.lifecycle {
+                        publish_model_control_result(
+                            observer.as_ref(),
+                            rest,
+                            ch,
+                            ThreadTags::default(),
+                            lifecycle,
+                        );
+                    }
+                }
+            }
+        }
         queue.mark_complete(ch);
         typing_channels.remove(&ch);
         tracing::warn!("cleared wedged in-flight channel {ch} from panicked agent {i}");
@@ -3522,6 +4103,7 @@ fn recover_panicked_agent(
 fn drain_ready_join_results(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
+    model_routes: &mut ModelRouteController,
     config: &Config,
     heartbeat_in_flight: &mut bool,
     removed_channels: &HashSet<Uuid>,
@@ -3530,13 +4112,15 @@ fn drain_ready_join_results(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
+    rest_client: Option<&relay::RestClient>,
 ) -> LoopAction {
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
             tracing::error!("agent task panicked: {join_error}");
-            recover_panicked_agent(
+            recover_panicked_agent_with_routes(
                 pool,
                 queue,
+                model_routes,
                 config,
                 join_error,
                 heartbeat_in_flight,
@@ -3546,6 +4130,7 @@ fn drain_ready_join_results(
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
+                rest_client,
             );
             if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
                 return LoopAction::Exit;
@@ -3587,6 +4172,7 @@ fn dispatch_heartbeat(
             result_tx,
             None,
             task_turn_id,
+            None,
         )
         .await;
     });
@@ -6234,6 +6820,212 @@ mod error_outcome_emission_tests {
             !is_auth_error(&timeout),
             "WriteTimeout must not be classified as auth error"
         );
+    }
+
+    #[test]
+    fn terminal_route_failure_requires_router_marker() {
+        let marked = acp::AcpError::AgentError {
+            code: -32043,
+            message: "PINCHPOINT_TERMINAL_AFTER_EFFECT: upstream disconnected after tool request"
+                .to_string(),
+        };
+        let ordinary = acp::AcpError::AgentError {
+            code: -32043,
+            message: "upstream disconnected before output".to_string(),
+        };
+        let exhausted = acp::AcpError::AgentError {
+            code: -32043,
+            message: "PINCHPOINT_TERMINAL_NO_RETRY: all qualified routes failed".to_string(),
+        };
+        let transport = acp::AcpError::AgentExited;
+
+        assert!(is_terminal_route_failure(&marked));
+        assert!(is_terminal_route_failure(&exhausted));
+        assert!(!is_terminal_route_failure(&ordinary));
+        assert!(!is_terminal_route_failure(&transport));
+    }
+
+    #[tokio::test]
+    async fn terminal_after_effect_is_not_requeued() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_id = uuid::Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let marked_error = acp::AcpError::AgentError {
+            code: -32043,
+            message: "PINCHPOINT_TERMINAL_AFTER_EFFECT: upstream disconnected after visible output"
+                .to_string(),
+        };
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            PromptResult {
+                agent,
+                source: PromptSource::Channel(channel_id),
+                turn_id: "test-turn-id".to_string(),
+                outcome: PromptOutcome::Error(marked_error),
+                batch: Some(batch),
+            },
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            queue.pending_channels(),
+            0,
+            "a post-effect route failure must never requeue the batch"
+        );
+        assert_eq!(
+            queue.queued_event_count(&channel_id),
+            0,
+            "a post-effect route failure must not duplicate visible or side-effecting work"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_attempt_explicit_failure_requeues_with_same_route_lease() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_id = uuid::Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let now = chrono::Utc::now();
+        let ledger = std::env::temp_dir().join(format!(
+            "buzz-model-route-requeue-test-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut model_routes =
+            crate::model_route::ModelRouteController::with_ledger_path("owner", ledger, true);
+        model_routes
+            .handle(
+                channel_id,
+                crate::model_route::parse_command("/model use opus5 --for turn"),
+                "owner",
+                "owner",
+                "01",
+                now.timestamp() as u64,
+                now,
+            )
+            .unwrap();
+        let lease = model_routes
+            .acquire(channel_id, "logical-turn-stable".to_string())
+            .lease
+            .unwrap();
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: lease.logical_turn_id.clone(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        pool.set_route_lease(task_id, lease.clone());
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        handle_prompt_result_with_routes(
+            &mut pool,
+            &mut queue,
+            &mut model_routes,
+            &config,
+            PromptResult {
+                agent,
+                source: PromptSource::Channel(channel_id),
+                turn_id: lease.logical_turn_id.clone(),
+                outcome: PromptOutcome::Error(AcpError::Protocol(
+                    "route arm transport failed before backend attempt".to_string(),
+                )),
+                batch: Some(batch),
+            },
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        assert_eq!(queue.pending_channels(), 1);
+        let retry = model_routes
+            .acquire(channel_id, "different-attempt-id".to_string())
+            .lease
+            .unwrap();
+        assert_eq!(retry.logical_turn_id, lease.logical_turn_id);
+        assert_eq!(retry.generation_id, lease.generation_id);
+        assert_eq!(retry.target, lease.target);
+        assert!(!retry.attempt_started());
     }
 
     // ── auth error dead-letter behavior ────────────────────────────────────

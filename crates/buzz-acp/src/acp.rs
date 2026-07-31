@@ -732,6 +732,26 @@ impl AcpClient {
         self.send_request("session/set_model", params).await
     }
 
+    /// Arm the Pinchpoint ACP routing adapter for the next `session/new`.
+    ///
+    /// This is an allowlisted private extension rather than a prompt command:
+    /// signed-event authorization and scope live in `buzz-acp`, while the
+    /// adapter owns child selection. The adapter consumes the arm exactly once
+    /// and binds the returned session to the requested generation and mode.
+    pub async fn pinchpoint_route_arm(
+        &mut self,
+        generation_id: u64,
+        target_model_id: &str,
+        strict: bool,
+    ) -> Result<serde_json::Value, AcpError> {
+        let params = serde_json::json!({
+            "generationId": generation_id,
+            "targetModelId": target_model_id,
+            "mode": if strict { "strict" } else { "default" },
+        });
+        self.send_request("_pinchpoint/route/arm", params).await
+    }
+
     /// Send `session/prompt` with idle-based timeout instead of wall-clock.
     ///
     /// The idle deadline resets on any stdout activity from the agent. The hard
@@ -1234,6 +1254,9 @@ impl AcpClient {
                     "_goose/unstable/session/update" => {
                         self.handle_goose_usage_update(&msg);
                     }
+                    "_pinchpoint/route_event" => {
+                        self.handle_pinchpoint_route_event(&msg);
+                    }
                     "session/request_permission" => {
                         self.handle_permission_request(&msg).await?;
                     }
@@ -1678,6 +1701,9 @@ impl AcpClient {
                             "_goose/unstable/session/update" => {
                                 self.handle_goose_usage_update(&msg);
                             }
+                            "_pinchpoint/route_event" => {
+                                self.handle_pinchpoint_route_event(&msg);
+                            }
                             "session/request_permission" => {
                                 self.handle_permission_request(&msg).await?;
                             }
@@ -1702,6 +1728,23 @@ impl AcpClient {
                 }
             }
         }
+    }
+
+    /// Forward the Pinchpoint router's metadata-only lifecycle notification to
+    /// Buzz's structured observer stream. Fallback notices deliberately use
+    /// only this control channel, so they never become model output or chat
+    /// history and the desktop never has to scrape prose for routing state.
+    fn handle_pinchpoint_route_event(&self, msg: &serde_json::Value) {
+        let Some(params) = msg.get("params").and_then(|value| value.as_object()) else {
+            tracing::warn!("_pinchpoint/route_event: missing object params");
+            return;
+        };
+        let mut payload = params.clone();
+        payload.insert(
+            "type".to_string(),
+            serde_json::Value::String("model_route".to_string()),
+        );
+        self.observe("control_result", serde_json::Value::Object(payload));
     }
 
     /// Log a `session/update` notification via tracing.
@@ -4315,6 +4358,42 @@ mod tests {
         });
         client.handle_goose_usage_update(&bad2);
         assert!(client.take_turn_usage().is_none());
+    }
+
+    #[tokio::test]
+    async fn pinchpoint_route_event_becomes_structured_control_result() {
+        let mut client = spawn_inert_client().await;
+        let observer = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 4);
+        client.set_observer_context(crate::observer::ObserverContext {
+            channel_id: Some("channel-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            started_at: None,
+        });
+        client.handle_pinchpoint_route_event(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "_pinchpoint/route_event",
+            "params": {
+                "action": "fallback",
+                "status": "active",
+                "target": "opus5",
+                "route_state": "active",
+                "fallback_enabled": true
+            }
+        }));
+
+        let events = observer.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "control_result");
+        assert_eq!(events[0].agent_index, Some(4));
+        assert_eq!(events[0].channel_id.as_deref(), Some("channel-1"));
+        assert_eq!(events[0].payload["type"], "model_route");
+        assert_eq!(events[0].payload["action"], "fallback");
+        assert_eq!(events[0].payload["status"], "active");
+        assert_eq!(events[0].payload["target"], "opus5");
+        assert_eq!(events[0].payload["route_state"], "active");
+        assert_eq!(events[0].payload["fallback_enabled"], true);
     }
 
     #[test]
