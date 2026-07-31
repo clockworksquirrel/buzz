@@ -215,31 +215,22 @@ pub(super) fn tombstone_team_catalog_at(
     crate::managed_agents::team_catalog::tombstone_team_catalog_coordinate(db_path, keys, d_tag)
 }
 
-/// Refresh or retract the shared 30178 head for `team` after a successful
-/// team edit.
+/// Refresh or retract the shared 30178 head for `team` after a team edit,
+/// resolving members from `personas` first.
 ///
-/// State machine:
-/// - No retained shared head → `Noop`: never-shared teams must never produce a 30178.
-/// - Retained shared head, rebuild succeeds → `Refreshed`.
-/// - Retained shared head, rebuild fails (oversize / missing member) →
-///   immediately purge + tombstone and return `RemovalQueued`.
-///
-/// Inbound reconcile and workspace-apply are excluded by the caller holding
-/// the store lock; this only fires from explicit owner-local mutations. The
-/// updated `members` slice must already reflect the just-saved state (the
-/// team's own ordered members, pre-resolved by the caller via
-/// `resolve_team_members`).
-/// Best-effort: failures are logged, not surfaced, so a retention hiccup
-/// never blocks a team rename or membership change from returning.
-pub(super) fn refresh_shared_team_catalog_head(
+/// Resolution failure (a member was deleted) is treated as a projection
+/// failure: the shared head is tombstoned and the owner is notified via the
+/// typed `team-catalog-auto-retracted` Tauri event. Best-effort: a retention
+/// hiccup never blocks the team edit from returning.
+pub(super) fn refresh_shared_team_catalog_head_resolving(
     app: &AppHandle,
     state: &AppState,
     team: &TeamRecord,
-    members: &[AgentDefinition],
+    personas: &[AgentDefinition],
 ) {
     let result = (|| -> Result<RefreshOrRetractOutcome, String> {
         let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        refresh_or_retract_shared_head_at(&scope.db_path, &scope.owner_keys, team, members)
+        resolve_and_refresh_or_retract_at(&scope.db_path, &scope.owner_keys, team, personas)
     })();
     match result {
         Ok(RefreshOrRetractOutcome::RemovalQueued { ref reason }) => {
@@ -253,6 +244,56 @@ pub(super) fn refresh_shared_team_catalog_head(
             eprintln!("buzz-desktop: team-catalog-refresh: '{}' — {e}", team.name);
         }
         _ => {}
+    }
+}
+
+/// Scope-free single-team core: resolve `team`'s members from `personas`,
+/// then run the refresh-or-retract state machine.
+///
+/// On resolution failure the head may already be shared; the function checks
+/// and tombstones if so, returning `RemovalQueued`. This is the ONLY place
+/// the "resolution failure → tombstone-if-shared" logic lives — both the
+/// production persona-edit path and the `#[cfg(test)]` file-based seam call
+/// this function so there is no divergence between tested and production code.
+pub(super) fn resolve_and_refresh_or_retract_at(
+    db_path: &std::path::Path,
+    keys: &nostr::Keys,
+    team: &TeamRecord,
+    personas: &[AgentDefinition],
+) -> Result<RefreshOrRetractOutcome, String> {
+    use crate::managed_agents::team_catalog::resolve_team_members;
+
+    match resolve_team_members(team, personas) {
+        Ok(members) => refresh_or_retract_shared_head_at(db_path, keys, team, &members),
+        Err(reason) => {
+            // Resolution failed (a required member is missing). Treat this
+            // identically to a projection build failure: tombstone the shared
+            // head if one exists, so the stale projection is not left live.
+            // `refresh_or_retract_shared_head_at` implements this exact policy
+            // when the builder returns Err — we reproduce the guard + tombstone
+            // inline so the resolution-error reason is preserved in the payload.
+            use crate::managed_agents::retention::{get_retained_event, open_retention_db};
+            use buzz_core_pkg::kind::{event_is_shared, KIND_TEAM_CATALOG};
+            use nostr::JsonUtil;
+
+            let pubkey = keys.public_key().to_hex();
+            let conn = open_retention_db(db_path)?;
+            let Some(existing) = get_retained_event(&conn, KIND_TEAM_CATALOG, &pubkey, &team.id)?
+            else {
+                return Ok(RefreshOrRetractOutcome::Noop);
+            };
+            let head_event = nostr::Event::from_json(&existing.raw_event)
+                .map_err(|e| format!("failed to parse retained head: {e}"))?;
+            if !event_is_shared(&head_event) {
+                return Ok(RefreshOrRetractOutcome::Noop);
+            }
+            // Shared head exists but team is now unresolvable — tombstone it.
+            drop(conn);
+            crate::managed_agents::team_catalog::tombstone_team_catalog_coordinate(
+                db_path, keys, &team.id,
+            )?;
+            Ok(RefreshOrRetractOutcome::RemovalQueued { reason })
+        }
     }
 }
 
@@ -343,9 +384,7 @@ pub(super) fn refresh_shared_team_catalog_heads_for_persona(
     persona_id: &str,
 ) {
     let result = (|| -> Result<(), String> {
-        use crate::managed_agents::{
-            load_personas, load_teams, team_catalog::resolve_team_members,
-        };
+        use crate::managed_agents::{load_personas, load_teams};
 
         let teams = load_teams(app)?;
         let personas = load_personas(app)?;
@@ -355,13 +394,14 @@ pub(super) fn refresh_shared_team_catalog_heads_for_persona(
             if team.is_builtin || !team.persona_ids.iter().any(|id| id == persona_id) {
                 continue;
             }
-            // Resolve only this team's members — never pass the full store.
-            // A resolution failure means a member was deleted; enter the
-            // failure/tombstone branch via a forwarded error outcome.
-            let members_result = resolve_team_members(team, &personas);
-            let outcome = members_result.and_then(|members| {
-                refresh_or_retract_shared_head_at(&scope.db_path, &scope.owner_keys, team, &members)
-            });
+            // Use the unified core so resolution failure → tombstone semantics
+            // are identical in production and in tests (no divergence).
+            let outcome = resolve_and_refresh_or_retract_at(
+                &scope.db_path,
+                &scope.owner_keys,
+                team,
+                &personas,
+            );
             match outcome {
                 Ok(RefreshOrRetractOutcome::RemovalQueued { ref reason }) => {
                     eprintln!(
@@ -389,9 +429,9 @@ pub(super) fn refresh_shared_team_catalog_heads_for_persona(
 /// Testable seam for [`refresh_shared_team_catalog_heads_for_persona`].
 ///
 /// Reads teams and personas from flat JSON files in `base_dir` rather than
-/// through the Tauri store. Used by unit tests that need to verify the privacy
-/// invariant — that only a team's own resolved members enter the projection —
-/// without a Tauri runtime.
+/// through the Tauri store. Calls the SAME `resolve_and_refresh_or_retract_at`
+/// that production uses — the seam is a thin file-loading shim with no
+/// independent logic. Tests therefore exercise the exact production code path.
 #[cfg(test)]
 pub(super) fn refresh_for_persona_at(
     base_dir: &std::path::Path,
@@ -400,7 +440,6 @@ pub(super) fn refresh_for_persona_at(
     persona_id: &str,
 ) -> Result<(), String> {
     use crate::event_sync::read_json_store_pub as read_json_store;
-    use crate::managed_agents::team_catalog::resolve_team_members;
 
     let teams: Vec<crate::managed_agents::TeamRecord> =
         read_json_store(&base_dir.join("teams.json"))?;
@@ -411,37 +450,8 @@ pub(super) fn refresh_for_persona_at(
         if team.is_builtin || !team.persona_ids.iter().any(|id| id == persona_id) {
             continue;
         }
-        // Mirrors the production path: resolution failure enters the
-        // failure/tombstone branch just like a projection failure does.
-        let outcome = match resolve_team_members(team, &personas) {
-            Ok(members) => refresh_or_retract_shared_head_at(db_path, keys, team, &members),
-            Err(reason) => {
-                // A missing member means the team can no longer be projected.
-                // Only tombstone when a retained shared head exists — otherwise
-                // there is nothing to retract.
-                use crate::managed_agents::retention::{get_retained_event, open_retention_db};
-                use buzz_core_pkg::kind::{event_is_shared, KIND_TEAM_CATALOG};
-                use nostr::JsonUtil;
-                let pubkey = keys.public_key().to_hex();
-                let should_tombstone = open_retention_db(db_path)
-                    .ok()
-                    .and_then(|conn| {
-                        get_retained_event(&conn, KIND_TEAM_CATALOG, &pubkey, &team.id).ok()
-                    })
-                    .flatten()
-                    .and_then(|row| nostr::Event::from_json(&row.raw_event).ok())
-                    .is_some_and(|event| event_is_shared(&event));
-                if should_tombstone {
-                    crate::managed_agents::team_catalog::tombstone_team_catalog_coordinate(
-                        db_path, keys, &team.id,
-                    )
-                    .map(|_| RefreshOrRetractOutcome::RemovalQueued { reason })
-                } else {
-                    Ok(RefreshOrRetractOutcome::Noop)
-                }
-            }
-        };
-        let _ = outcome;
+        // Identical call to production — no parallel implementation.
+        let _ = resolve_and_refresh_or_retract_at(db_path, keys, team, &personas);
     }
     Ok(())
 }

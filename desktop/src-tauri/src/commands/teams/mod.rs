@@ -240,16 +240,12 @@ pub async fn update_team(input: UpdateTeamRequest, app: AppHandle) -> Result<Tea
         // Built-in teams are not owner-authored — never publish them.
         if !updated.is_builtin {
             retain_team_pending(&app, &state, &updated);
-            // F2: if this team has a shared 30178 head, reproject it now
-            // so the catalog reflects the edit immediately rather than
-            // waiting for the next workspace apply or restart. Best-effort
-            // (failures logged, not surfaced) so a retention hiccup never
-            // blocks the team rename from returning.
-            if let Ok(members) =
-                crate::managed_agents::team_catalog::resolve_team_members(&updated, &personas)
-            {
-                pending::refresh_shared_team_catalog_head(&app, &state, &updated, &members);
-            }
+            // Reproject the shared 30178 head immediately so the catalog
+            // reflects the edit. Resolution failure (a member was deleted
+            // mid-edit) is treated as a projection failure — the shared head
+            // is tombstoned and the owner is notified via a typed notice.
+            // Best-effort: a retention hiccup never blocks the team edit.
+            pending::refresh_shared_team_catalog_head_resolving(&app, &state, &updated, &personas);
         }
         Ok(updated)
     })

@@ -355,7 +355,7 @@ fn test_team_edit_refreshes_a_shared_head() {
     assert!(before.content.contains("One"));
 
     // Rename the member; refresh_or_retract_shared_head_at with shared_override:None
-    // is what refresh_shared_team_catalog_head calls.
+    // is what refresh_shared_team_catalog_head_resolving calls.
     let new_members = vec![member("m1", "Renamed"), member("m2", "Two")];
     refresh_or_retract_shared_head_at(&db_path, &keys, &team(), &new_members).unwrap();
 
