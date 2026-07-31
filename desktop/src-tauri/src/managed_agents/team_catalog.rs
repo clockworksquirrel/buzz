@@ -226,13 +226,26 @@ pub fn member_key_for(record: &AgentDefinition) -> String {
 
 /// Project one member definition, without the built-in reuse hint.
 fn member_projection(record: &AgentDefinition) -> TeamCatalogMember {
+    // For built-in members, the install-local avatar can be a 170–190 KiB
+    // inline PNG data URL, which exceeds MAX_AVATAR_URL_BYTES (32 KiB). A
+    // recipient who reuses the local built-in gets its local avatar anyway —
+    // that is the point of the reuse hint. For a fallback copy (hostile hash),
+    // omitting the oversized avatar is acceptable for v1: the recipient sees
+    // the default avatar. Either way, projecting an oversized avatar would
+    // cause the entire team publication to fail the size contract (I7).
+    let avatar_url = record
+        .avatar_url
+        .as_deref()
+        .filter(|url| url.len() <= MAX_AVATAR_URL_BYTES)
+        .map(|url| url.to_string());
+
     TeamCatalogMember {
         member_key: member_key_for(record),
         display_name: record.display_name.clone(),
         // Mirrors `persona_event_content`: always `Some`, including for an
         // empty prompt, so the encoding does not depend on emptiness.
         system_prompt: Some(record.system_prompt.clone()),
-        avatar_url: record.avatar_url.clone(),
+        avatar_url,
         runtime: record.runtime.clone(),
         model: record.model.clone(),
         provider: record.provider.clone(),
@@ -528,23 +541,6 @@ pub fn build_team_catalog_event(
     Ok(EventBuilder::new(Kind::Custom(KIND_TEAM_CATALOG as u16), content_json).tags(tags))
 }
 
-/// Build an unsigned kind:30178 event that republishes `content_json`
-/// verbatim without the `shared` tag.
-///
-/// Retraction re-signs the retained body rather than reprojecting the team,
-/// because retraction is triggered exactly when reprojection is impossible —
-/// a member was deleted, or the team outgrew the size contract. The retained
-/// body was already built and accepted at its own bounds, so replaying it
-/// cannot fail the checks a fresh projection would. The team stays published
-/// and readable by its author; only its discoverability is withdrawn.
-pub fn build_team_catalog_retraction(
-    d_tag: &str,
-    content_json: &str,
-) -> Result<EventBuilder, String> {
-    let tag = Tag::parse(["d", d_tag]).map_err(|e| format!("invalid d-tag: {e}"))?;
-    Ok(EventBuilder::new(Kind::Custom(KIND_TEAM_CATALOG as u16), content_json).tags(vec![tag]))
-}
-
 /// Parse a kind:30178 event body, rejecting an unrecognized schema version.
 ///
 /// Version dispatch happens before field access: a future `v: 2` body may
@@ -585,6 +581,11 @@ pub fn build_team_catalog_delete(
 /// both reach `commands::teams::pending::tombstone_team_catalog_at`:
 /// - `commands::teams::pending` (direct delete_team path)
 /// - `event_sync` (boot reconcile for orphaned shared heads, F1)
+/// - `commands::teams::pending` (immediate retraction on I2 failure)
+///
+/// The two SQLite operations (DELETE retained row + INSERT tombstone) run in a
+/// single transaction. A kill between them would otherwise leave the relay
+/// head shared indefinitely — the exact A3 failure mode (I3).
 ///
 /// Splitting the shared logic here avoids a cross-module layering violation
 /// while keeping the two callers in agreement about what a tombstone is.
@@ -594,8 +595,7 @@ pub fn tombstone_team_catalog_coordinate(
     d_tag: &str,
 ) -> Result<(), String> {
     use crate::managed_agents::retention::{
-        delete_retained_event, open_retention_db, retain_event, tombstone_retention_d_tag,
-        RetainedEvent,
+        open_retention_db, retain_event, tombstone_retention_d_tag, RetainedEvent,
     };
     use nostr::JsonUtil;
 
@@ -605,22 +605,41 @@ pub fn tombstone_team_catalog_coordinate(
     let event = build_team_catalog_delete(d_tag, &pubkey)?
         .sign_with_keys(keys)
         .map_err(|e| format!("failed to sign team catalog tombstone: {e}"))?;
+    let tombstone = RetainedEvent {
+        kind: KIND_DELETE,
+        pubkey: pubkey.clone(),
+        // Key by the target coordinate so the 30176 and 30178
+        // tombstones for one team occupy distinct rows.
+        d_tag: tombstone_retention_d_tag(KIND_TEAM_CATALOG, d_tag),
+        content: event.content.to_string(),
+        created_at: event.created_at.as_secs() as i64,
+        raw_event: event.as_json(),
+        pending_sync: true,
+    };
+
     let conn = open_retention_db(db_path)?;
-    delete_retained_event(&conn, KIND_TEAM_CATALOG, &pubkey, d_tag)?;
-    retain_event(
-        &conn,
-        &RetainedEvent {
-            kind: KIND_DELETE,
-            pubkey,
-            // Key by the target coordinate so the 30176 and 30178
-            // tombstones for one team occupy distinct rows.
-            d_tag: tombstone_retention_d_tag(KIND_TEAM_CATALOG, d_tag),
-            content: event.content.to_string(),
-            created_at: event.created_at.as_secs() as i64,
-            raw_event: event.as_json(),
-            pending_sync: true,
-        },
-    )
+    // Wrap the DELETE + INSERT in a single transaction so a process kill
+    // between them cannot leave the relay head shared indefinitely (I3).
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| format!("failed to begin tombstone transaction: {e}"))?;
+    let result = (|| -> Result<(), String> {
+        conn.execute(
+            "DELETE FROM persona_events
+             WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
+            rusqlite::params![KIND_TEAM_CATALOG, &pubkey, d_tag],
+        )
+        .map_err(|e| format!("failed to purge retained 30178 head: {e}"))?;
+        retain_event(&conn, &tombstone)
+    })();
+    match result {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|e| format!("failed to commit tombstone transaction: {e}")),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

@@ -301,14 +301,20 @@ fn test_member_count_at_the_limit_is_accepted_and_one_over_is_rejected() {
 }
 
 #[test]
-fn test_oversized_avatar_is_rejected_and_names_the_member() {
+fn test_oversized_avatar_is_omitted_from_the_projection() {
+    // I7: a built-in avatar that exceeds MAX_AVATAR_URL_BYTES is silently
+    // omitted from the projection rather than causing a build failure. The
+    // team stays publishable; the recipient sees the default avatar instead.
     let mut one = member("m1", "Avatar Hog");
     one.avatar_url = Some("d".repeat(MAX_AVATAR_URL_BYTES + 1));
 
-    let error = build_team_catalog_content(&team(), &[one]).unwrap_err();
+    let content = build_team_catalog_content(&team(), &[one]).unwrap();
 
-    assert!(error.contains("team too large to share"), "{error}");
-    assert!(error.contains("Avatar Hog"), "{error}");
+    assert_eq!(content.members.len(), 1);
+    assert!(
+        content.members[0].avatar_url.is_none(),
+        "oversized avatar must be omitted — not rejected — from the projection"
+    );
 }
 
 #[test]
@@ -434,10 +440,17 @@ fn test_shared_tag_is_present_only_when_sharing() {
 fn test_oversized_team_fails_before_an_event_is_ever_built() {
     // The whole point of pre-enqueue validation: no signed event exists to be
     // durably queued and then permanently refused by the relay.
-    let mut one = member("m1", "One");
-    one.avatar_url = Some("d".repeat(MAX_AVATAR_URL_BYTES + 1));
+    // With I7, an oversized avatar is silently omitted rather than causing a
+    // build failure — so this test uses a total-size violation instead.
+    let members: Vec<AgentDefinition> = (0..MAX_MEMBERS)
+        .map(|i| {
+            let mut one = member(&format!("m{i}"), &format!("Member {i}"));
+            one.system_prompt = "p".repeat(MAX_SYSTEM_PROMPT_BYTES);
+            one
+        })
+        .collect();
 
-    assert!(build_team_catalog_event(&team(), &[one], true).is_err());
+    assert!(build_team_catalog_event(&team(), &members, true).is_err());
 }
 
 // ── Inbound parsing ─────────────────────────────────────────────────────────
@@ -745,4 +758,118 @@ fn test_catalog_delete_targets_the_30178_coordinate_with_no_e_tag() {
         .tags
         .iter()
         .all(|tag| tag.as_slice().first().map(String::as_str) != Some("e")));
+}
+
+// ── Shared JSON fixture matrix (I8) ─────────────────────────────────────────
+//
+// Each fixture file is a raw 30178 content body string.  These same files are
+// consumed by the TS test suite (teamCatalogRelay.test.mjs) so a drift between
+// the two validators surfaces immediately in CI.
+
+macro_rules! fixture {
+    ($name:literal) => {
+        include_str!(concat!(
+            "../../../tests/fixtures/team_catalog_content/",
+            $name
+        ))
+    };
+}
+
+#[test]
+fn test_fixture_valid_minimal_is_accepted() {
+    let event = signed_event_with_content(fixture!("valid_minimal.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_ok(),
+        "valid_minimal.json must be accepted"
+    );
+}
+
+#[test]
+fn test_fixture_valid_respond_to_owner_only_is_accepted() {
+    let event = signed_event_with_content(fixture!("valid_respond_to_owner_only.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_ok(),
+        "valid_respond_to_owner_only.json must be accepted"
+    );
+}
+
+#[test]
+fn test_fixture_valid_respond_to_allowlist_is_accepted() {
+    let event = signed_event_with_content(fixture!("valid_respond_to_allowlist.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_ok(),
+        "valid_respond_to_allowlist.json must be accepted"
+    );
+}
+
+#[test]
+fn test_fixture_valid_respond_to_anyone_is_accepted() {
+    let event = signed_event_with_content(fixture!("valid_respond_to_anyone.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_ok(),
+        "valid_respond_to_anyone.json must be accepted"
+    );
+}
+
+#[test]
+fn test_fixture_valid_uppercase_hash_is_accepted() {
+    // The Rust validator accepts uppercase hex for projection_hash via
+    // is_ascii_hexdigit(); the TS validator must also accept it (I8 alignment).
+    let event = signed_event_with_content(fixture!("valid_uppercase_hash.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_ok(),
+        "valid_uppercase_hash.json must be accepted"
+    );
+}
+
+#[test]
+fn test_fixture_invalid_respond_to_pascal_case_is_rejected() {
+    // "OwnerOnly" is the pre-fix TS enum value; the wire protocol uses
+    // kebab-case ("owner-only"). Both validators must reject the Pascal-case form.
+    let event = signed_event_with_content(fixture!("invalid_respond_to_pascal_case.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_err(),
+        "invalid_respond_to_pascal_case.json must be rejected"
+    );
+}
+
+#[test]
+fn test_fixture_invalid_description_wrong_type_is_rejected() {
+    // description must be a string or absent; a numeric value is invalid.
+    let event = signed_event_with_content(fixture!("invalid_description_wrong_type.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_err(),
+        "invalid_description_wrong_type.json must be rejected"
+    );
+}
+
+#[test]
+fn test_fixture_invalid_instructions_wrong_type_is_rejected() {
+    // instructions must be a string or absent; a boolean value is invalid.
+    let event = signed_event_with_content(fixture!("invalid_instructions_wrong_type.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_err(),
+        "invalid_instructions_wrong_type.json must be rejected"
+    );
+}
+
+#[test]
+fn test_fixture_invalid_duplicate_member_key_is_rejected() {
+    // Two members with the same member_key collapse to one provenance entry
+    // at adoption time and must be refused by both validators.
+    let event = signed_event_with_content(fixture!("invalid_duplicate_member_key.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_err(),
+        "invalid_duplicate_member_key.json must be rejected"
+    );
+}
+
+#[test]
+fn test_fixture_invalid_name_pool_not_array_is_rejected() {
+    // name_pool must be an array when present; a bare string is invalid.
+    let event = signed_event_with_content(fixture!("invalid_name_pool_not_array.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_err(),
+        "invalid_name_pool_not_array.json must be rejected"
+    );
 }
