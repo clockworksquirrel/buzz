@@ -199,23 +199,100 @@ pub(super) fn tombstone_team_catalog_at(
     crate::managed_agents::team_catalog::tombstone_team_catalog_coordinate(db_path, keys, d_tag)
 }
 
-/// Refresh the shared 30178 head for `team` after a successful team edit.
+/// Refresh or retract the shared 30178 head for `team` after a successful
+/// team edit.
+///
+/// State machine:
+/// - No retained head → no-op: never-shared teams must never produce a 30178.
+/// - Retained shared head, rebuild succeeds → retain the newer head.
+/// - Retained shared head, rebuild fails (oversize / missing member) →
+///   immediately purge + tombstone so the stale head is not left public.
 ///
 /// Inbound reconcile and workspace-apply are excluded by the caller holding
 /// the store lock; this only fires from explicit owner-local mutations. The
 /// updated `members` slice must already reflect the just-saved state.
-/// Best-effort: a failure is logged rather than surfaced, so a retention
-/// hiccup never blocks a team rename or membership change from returning.
+/// Best-effort: failures are logged, not surfaced, so a retention hiccup
+/// never blocks a team rename or membership change from returning.
 pub(super) fn refresh_shared_team_catalog_head(
     app: &AppHandle,
     state: &AppState,
     team: &TeamRecord,
     members: &[AgentDefinition],
 ) {
-    let result = prepare_team_publication(app, state, team, members, None).map(|_| ());
+    let result = (|| -> Result<(), String> {
+        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        refresh_or_retract_shared_head_at(&scope.db_path, &scope.owner_keys, team, members)
+    })();
     if let Err(e) = result {
         eprintln!("buzz-desktop: team-catalog-refresh: '{}' — {e}", team.name);
     }
+}
+
+/// Core of [`refresh_shared_team_catalog_head`], scope-free so it is
+/// testable without a Tauri `AppHandle`.
+pub(super) fn refresh_or_retract_shared_head_at(
+    db_path: &std::path::Path,
+    keys: &nostr::Keys,
+    team: &TeamRecord,
+    members: &[AgentDefinition],
+) -> Result<(), String> {
+    use crate::managed_agents::{
+        persona_events::monotonic_created_at,
+        retention::{get_retained_event, open_retention_db, retain_event},
+        team_catalog::build_team_catalog_event,
+    };
+    use buzz_core_pkg::kind::{event_is_shared, KIND_TEAM_CATALOG};
+    use nostr::JsonUtil;
+
+    let pubkey = keys.public_key().to_hex();
+    let conn = open_retention_db(db_path)?;
+
+    // Guard: only act when a retained shared head exists. A never-shared team
+    // must never produce a 30178 row — failing to check this was the I1
+    // security issue.
+    let Some(existing) = get_retained_event(&conn, KIND_TEAM_CATALOG, &pubkey, &team.id)? else {
+        return Ok(());
+    };
+    let head_event = nostr::Event::from_json(&existing.raw_event)
+        .map_err(|e| format!("failed to parse retained head: {e}"))?;
+    if !event_is_shared(&head_event) {
+        return Ok(());
+    }
+
+    // Attempt to rebuild. On failure, purge + tombstone immediately so the
+    // stale shared head is not left public until the next boot (I2).
+    let rebuilt = build_team_catalog_event(team, members, true);
+    let builder = match rebuilt {
+        Ok(b) => b,
+        Err(reason) => {
+            eprintln!(
+                "buzz-desktop: team-catalog-refresh: retracting '{}' — {reason}",
+                team.name
+            );
+            drop(conn); // close read connection before the tombstone opens another
+            return crate::managed_agents::team_catalog::tombstone_team_catalog_coordinate(
+                db_path, keys, &team.id,
+            );
+        }
+    };
+
+    let event = builder
+        .custom_created_at(monotonic_created_at(Some(existing.created_at)))
+        .sign_with_keys(keys)
+        .map_err(|e| format!("failed to sign team catalog head: {e}"))?;
+
+    retain_event(
+        &conn,
+        &crate::managed_agents::retention::RetainedEvent {
+            kind: KIND_TEAM_CATALOG,
+            pubkey,
+            d_tag: team.id.clone(),
+            content: event.content.to_string(),
+            created_at: event.created_at.as_secs() as i64,
+            raw_event: event.as_json(),
+            pending_sync: true,
+        },
+    )
 }
 
 /// Refresh or retract the shared 30178 heads of every team that includes
@@ -239,34 +316,14 @@ pub(super) fn refresh_shared_team_catalog_heads_for_persona(
             if team.is_builtin || !team.persona_ids.iter().any(|id| id == persona_id) {
                 continue;
             }
-            // Only act if the team has a shared head — checking before
-            // projecting avoids spurious retain calls for unshared teams.
-            use crate::managed_agents::retention::{get_retained_event, open_retention_db};
-            use buzz_core_pkg::kind::{event_is_shared, KIND_TEAM_CATALOG};
-            use nostr::JsonUtil;
-
-            let conn = open_retention_db(&scope.db_path)?;
-            let Some(existing) = get_retained_event(
-                &conn,
-                KIND_TEAM_CATALOG,
-                &scope.owner_keys.public_key().to_hex(),
-                &team.id,
-            )?
-            else {
-                continue;
-            };
-            let head_event = nostr::Event::from_json(&existing.raw_event)
-                .map_err(|e| format!("failed to parse retained head: {e}"))?;
-            if !event_is_shared(&head_event) {
-                continue;
-            }
-
-            if let Err(e) = prepare_team_publication_at(
+            // refresh_or_retract_shared_head_at handles the shared-head guard,
+            // refresh on success, and immediate purge+tombstone on failure —
+            // one consistent policy for every edit path.
+            if let Err(e) = refresh_or_retract_shared_head_at(
                 &scope.db_path,
                 &scope.owner_keys,
                 team,
                 &personas,
-                None,
             ) {
                 eprintln!(
                     "buzz-desktop: team-catalog-refresh: '{}' after persona edit — {e}",

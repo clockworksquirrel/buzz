@@ -338,7 +338,7 @@ fn test_catalog_tombstone_does_not_clobber_the_team_tombstone() {
     assert_eq!(keys_seen, ["30176:team-abc", "30178:team-abc"]);
 }
 
-// ── F2: immediate refresh / retract after interactive edits ─────────────────
+// ── F2 / I1 / I2: refresh_or_retract_shared_head_at ──────────────────────
 
 #[test]
 fn test_team_edit_refreshes_a_shared_head() {
@@ -354,10 +354,10 @@ fn test_team_edit_refreshes_a_shared_head() {
     let before = retained_head(&db_path, &owner).unwrap();
     assert!(before.content.contains("One"));
 
-    // Rename the member; prepare_team_publication_at with shared_override:None
+    // Rename the member; refresh_or_retract_shared_head_at with shared_override:None
     // is what refresh_shared_team_catalog_head calls.
     let new_members = vec![member("m1", "Renamed"), member("m2", "Two")];
-    prepare_team_publication_at(&db_path, &keys, &team(), &new_members, None).unwrap();
+    refresh_or_retract_shared_head_at(&db_path, &keys, &team(), &new_members).unwrap();
 
     let after = retained_head(&db_path, &owner).unwrap();
     assert!(
@@ -368,67 +368,95 @@ fn test_team_edit_refreshes_a_shared_head() {
         after.pending_sync,
         "the refreshed head must be queued for the flush loop"
     );
-    // Shared tag must be preserved (shared_override: None).
+    // Shared tag must be preserved.
     let event = nostr::Event::from_json(&after.raw_event).unwrap();
     assert!(event_is_shared(&event), "refresh must not unshare the team");
 }
 
 #[test]
-fn test_team_edit_retracts_when_member_resolves_to_oversize() {
-    // A member rename that pushes past MAX_TOTAL_BYTES is the retraction
-    // trigger. Verify that a failed projection produces an unshared head.
-    // (Easiest proxy: member with a system_prompt that exceeds the per-member
-    // limit.)
+fn test_team_edit_retracts_immediately_when_projection_fails() {
+    // A member edit that pushes past MAX_TOTAL_BYTES or MAX_SYSTEM_PROMPT_BYTES
+    // must immediately purge+tombstone the shared head — not leave it public
+    // until the next boot (I2).
     let dir = tempfile::tempdir().unwrap();
     let keys = nostr::Keys::generate();
     let owner = keys.public_key().to_hex();
     let db_path = scoped_db(dir.path(), "wss://a.example", &owner);
 
+    // Initial share.
     prepare_team_publication_at(&db_path, &keys, &team(), &members(), Some(true)).unwrap();
+    assert!(
+        retained_head(&db_path, &owner).is_some(),
+        "shared head exists"
+    );
 
-    // build_team_catalog_event fails for a member with a prompt past
-    // MAX_SYSTEM_PROMPT_BYTES (16 KiB).
-    let mut oversized = member("m1", &"x".repeat(17 * 1024));
-    oversized.id = "m1".to_string();
+    // A member with a system_prompt that exceeds MAX_SYSTEM_PROMPT_BYTES (16 KiB)
+    // causes build_team_catalog_event to fail.
+    let mut oversized = member("m1", "One");
+    oversized.system_prompt = "x".repeat(17 * 1024);
     let bad_members = vec![oversized, member("m2", "Two")];
 
-    // prepare_team_publication_at with None propagates the failure back to the
-    // caller (refresh_shared_team_catalog_head logs it and continues).
-    let result = prepare_team_publication_at(&db_path, &keys, &team(), &bad_members, None);
-    // The result is Err because build_team_catalog_event fails; the caller
-    // (refresh helper) logs and moves on — the retraction path is via the
-    // next boot reconcile which sees the oversized projection as unreproducible.
+    // refresh_or_retract_shared_head_at must succeed (Ok) even on projection
+    // failure — the failure triggers a tombstone, not an error return.
+    refresh_or_retract_shared_head_at(&db_path, &keys, &team(), &bad_members).unwrap();
+
+    // The 30178 head must have been purged.
+    let head_after = retained_head(&db_path, &owner);
     assert!(
-        result.is_err(),
-        "an oversized projection must fail synchronously"
+        head_after.is_none(),
+        "oversized projection must immediately purge the shared 30178 head"
+    );
+
+    // A kind:5 tombstone must be queued.
+    let conn = open_retention_db(&db_path).unwrap();
+    let pending = get_pending_sync(&conn).unwrap();
+    assert!(
+        pending.iter().any(|row| row.kind == 5),
+        "a kind:5 tombstone must be queued after immediate retraction"
     );
 }
 
 #[test]
-fn test_refresh_for_persona_skips_unshared_teams() {
-    // prepare_team_publication_at must not be called (no head must appear) for
-    // a team that was never shared, even when the persona is a member.
+fn test_refresh_skips_never_shared_team() {
+    // A never-shared team must produce no 30178 row even after refresh is
+    // called — this is the I1 security guard.
     let dir = tempfile::tempdir().unwrap();
     let keys = nostr::Keys::generate();
     let owner = keys.public_key().to_hex();
     let db_path = scoped_db(dir.path(), "wss://a.example", &owner);
 
-    // No retained head at all — simulate what refresh_for_persona would see.
-    let conn = open_retention_db(&db_path).unwrap();
-    assert!(
-        get_retained_event(&conn, KIND_TEAM_CATALOG, &owner, "team-abc")
-            .unwrap()
-            .is_none(),
-        "precondition: no head exists"
-    );
+    // No retained head at all — simulate what an edit of a never-shared team sees.
+    let result = refresh_or_retract_shared_head_at(&db_path, &keys, &team(), &members());
+    assert!(result.is_ok(), "no-op must return Ok");
 
-    // The helper checks for a shared head before projecting; calling
-    // prepare_team_publication_at unconditionally would create a head even for
-    // an unshared team — this test verifies the guard.
-    // Simulate the guard: no existing head → no action.
-    let existing = get_retained_event(&conn, KIND_TEAM_CATALOG, &owner, "team-abc").unwrap();
+    // No head must have been written.
     assert!(
-        existing.is_none(),
-        "no head should be written for an unshared team"
+        retained_head(&db_path, &owner).is_none(),
+        "never-shared team must produce no 30178 row after refresh"
+    );
+}
+
+#[test]
+fn test_refresh_skips_unshared_retained_head() {
+    // A team with a retained unshared (retracted) head must also be a no-op —
+    // only a live shared head triggers a refresh.
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let owner = keys.public_key().to_hex();
+    let db_path = scoped_db(dir.path(), "wss://a.example", &owner);
+
+    // Retain an unshared head (what unshare produces).
+    prepare_team_publication_at(&db_path, &keys, &team(), &members(), Some(false)).unwrap();
+    let before = retained_head(&db_path, &owner).unwrap();
+    let before_content = before.content.clone();
+
+    // Rename a member and call refresh — the unshared head must not be touched.
+    let new_members = vec![member("m1", "Renamed"), member("m2", "Two")];
+    refresh_or_retract_shared_head_at(&db_path, &keys, &team(), &new_members).unwrap();
+
+    let after = retained_head(&db_path, &owner).unwrap();
+    assert_eq!(
+        after.content, before_content,
+        "unshared head must not be refreshed"
     );
 }
