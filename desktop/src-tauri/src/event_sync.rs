@@ -432,12 +432,19 @@ fn reconcile_team_catalog_heads_core(
         // catalog stops showing it. This is the case the team-first loop
         // could never see.
         let Some(team) = teams.iter().find(|t| t.id == head.d_tag) else {
-            eprintln!(
-                "buzz-desktop: team-catalog-reconcile: tombstoning '{}' — team no longer exists",
-                head.d_tag
-            );
-            // best-effort: a failure here is logged and skipped; the next
-            // boot will retry via the same worklist.
+            // Retrieve the team name from the head's content for the notice,
+            // falling back to the d-tag when content is unparseable.
+            let team_name = (|| -> Option<String> {
+                let content: serde_json::Value =
+                    serde_json::from_str(head_event.content.as_ref()).ok()?;
+                content.get("name")?.as_str().map(str::to_string)
+            })()
+            .unwrap_or_else(|| head.d_tag.clone());
+            let reason = "team no longer exists".to_string();
+            eprintln!("buzz-desktop: team-catalog-reconcile: tombstoning '{team_name}' — {reason}");
+            // `tombstone_team_catalog_coordinate` opens its own connection
+            // (WAL mode allows concurrent connections); `conn` is kept alive
+            // for the success-path retain_event calls in subsequent iterations.
             if let Err(e) = tombstone_team_catalog_coordinate(db_path, keys, &head.d_tag) {
                 eprintln!(
                     "buzz-desktop: team-catalog-reconcile: tombstone failed for '{}': {e}",
@@ -445,6 +452,9 @@ fn reconcile_team_catalog_heads_core(
                 );
             } else {
                 reconciled += 1;
+                if let Some(app) = app {
+                    emit_team_catalog_auto_retracted(app, &team_name, &reason);
+                }
             }
             continue;
         };
@@ -456,7 +466,7 @@ fn reconcile_team_catalog_heads_core(
 
         // Reproject from the current on-disk team and members. A failure here
         // is the retraction trigger: purge + tombstone the coordinate and
-        // notify the owner via a typed frontend event (I4). The stale-body
+        // notify the owner via a typed frontend event. The stale-body
         // "retraction" pattern was replaced because an unshared-but-retained
         // coordinate leaves the event live on the relay with no opt-in tag.
         let rebuilt = resolve_team_members(team, &personas)
@@ -468,10 +478,10 @@ fn reconcile_team_catalog_heads_core(
                     "buzz-desktop: team-catalog-reconcile: tombstoning '{}' — {reason}",
                     team.name
                 );
-                // Close the read connection so the tombstone can open its own
-                // write connection without busy-waiting (WAL mode allows it,
-                // but explicit drop is cleaner for test isolation).
-                drop(conn);
+                // `tombstone_team_catalog_coordinate` opens its own WAL
+                // connection; there is no need to drop `conn`, and NOT
+                // dropping it is what allows the loop to continue processing
+                // remaining heads (I2 — multi-head continuation).
                 if let Err(e) = tombstone_team_catalog_coordinate(db_path, keys, &team.id) {
                     eprintln!(
                         "buzz-desktop: team-catalog-reconcile: tombstone failed for '{}': {e}",
@@ -483,10 +493,10 @@ fn reconcile_team_catalog_heads_core(
                         emit_team_catalog_auto_retracted(app, &team.name, &reason);
                     }
                 }
-                // conn was moved; we cannot continue the loop — return with
-                // what was reconciled so far. The next boot will pick up any
-                // remaining heads (all_heads was snapshotted before the loop).
-                return Ok(reconciled);
+                // Continue to the next retained head — do not stop after the
+                // first tombstone (the original `drop(conn); return` pattern
+                // was the I2 bug).
+                continue;
             }
         };
 
@@ -555,6 +565,15 @@ fn read_json_store<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("failed to read {name}: {e}"))?;
     serde_json::from_str(&content).map_err(|e| format!("failed to parse {name}: {e}"))
+}
+
+/// Test-accessible alias for `read_json_store`, used by the `pending` module's
+/// `refresh_for_persona_at` testable seam without re-exporting the private fn.
+#[cfg(test)]
+pub(crate) fn read_json_store_pub<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<Vec<T>, String> {
+    read_json_store(path)
 }
 
 /// Read every persona definition in the legacy shape, from whichever store

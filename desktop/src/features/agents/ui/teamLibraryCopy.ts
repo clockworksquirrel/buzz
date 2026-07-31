@@ -20,6 +20,22 @@ export const teamCatalogCopy = {
 } as const;
 
 /**
+ * The warning notice shown when the backend automatically queues a retraction
+ * for a shared team that can no longer be projected.
+ *
+ * "Queued" is accurate — the tombstone has been enqueued for the flush loop
+ * but the relay head may still be discoverable until the flush succeeds.
+ * Using "queued for removal" rather than "was removed" avoids a false claim
+ * that the catalog has already changed.
+ */
+export function teamAutoRetractedNotice(
+  teamName: string,
+  reason: string,
+): string {
+  return `"${teamName}" has been queued for removal from the community catalog because it can no longer be projected: ${reason}`;
+}
+
+/**
  * The result message for a share toggle.
  *
  * `queued` is not a failure: the head is durably enqueued and the flush loop

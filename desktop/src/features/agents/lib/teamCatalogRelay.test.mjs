@@ -9,7 +9,10 @@ import {
   parseTeamCatalogContent,
   teamCatalogPublicationsFromEvents,
 } from "./teamCatalogRelay.ts";
-import { teamCatalogCopy } from "../ui/teamLibraryCopy.ts";
+import {
+  teamAutoRetractedNotice,
+  teamCatalogCopy,
+} from "../ui/teamLibraryCopy.ts";
 
 const ALICE = "a".repeat(64);
 const BOB = "b".repeat(64);
@@ -211,27 +214,44 @@ test("test_a_team_with_no_members_is_still_a_valid_projection", () => {
   assert.deepEqual(publications[0].members, []);
 });
 
-/** The avatar a member projects for `avatarUrl`, or null if dropped. */
+/** The avatar a member projects for `avatarUrl`, or null if dropped/invalid. */
 function memberAvatarUrl(avatarUrl) {
   const publications = teamCatalogPublicationsFromEvents([
     teamEvent({ members: [member({ avatar_url: avatarUrl })] }),
   ]);
+  // When the avatar URL fails memberPassesV1, the member is invalid and not
+  // rendered. Return a sentinel so callers can distinguish "valid member with
+  // null avatar" from "invalid member" in assertions.
+  if (publications[0].members.length === 0) {
+    return { invalid: true };
+  }
   return publications[0].members[0].avatarUrl;
 }
 
 // A team embeds N member avatars, so it must be held to exactly the persona
 // allowlist rather than the permissive string read it started with.
-test("test_member_avatars_keep_bounded_http_urls_and_drop_unsafe_schemes", () => {
+test("test_member_avatars_keep_bounded_http_urls_and_reject_unsafe_schemes", () => {
   assert.equal(
     memberAvatarUrl("https://relay.example/avatar.png"),
     "https://relay.example/avatar.png",
   );
-  assert.equal(memberAvatarUrl("javascript:alert(1)"), null);
-  assert.equal(
-    memberAvatarUrl(`data:image/svg+xml;base64,${btoa("<svg/>")}`),
-    null,
+  // Unsafe avatar URLs now mark the member as INVALID (not just drop the URL),
+  // so Add is disabled at the source rather than showing a blank avatar.
+  assert.deepEqual(
+    memberAvatarUrl("javascript:alert(1)"),
+    { invalid: true },
+    "javascript: avatar must mark the member invalid",
   );
-  assert.equal(memberAvatarUrl("data:image/png,%89PNG"), null);
+  assert.deepEqual(
+    memberAvatarUrl(`data:image/svg+xml;base64,${btoa("<svg/>")}`),
+    { invalid: true },
+    "svg+xml;base64 is not in the safe allowlist — must mark the member invalid",
+  );
+  assert.deepEqual(
+    memberAvatarUrl("data:image/png,%89PNG"),
+    { invalid: true },
+    "non-base64 data URL must mark the member invalid",
+  );
 });
 
 test("test_percent_encoded_emoji_member_avatar_survives_the_catalog", () => {
@@ -243,8 +263,14 @@ test("test_percent_encoded_emoji_member_avatar_survives_the_catalog", () => {
 test("test_oversized_inline_svg_member_avatar_is_rejected", () => {
   const withinCap = `data:image/svg+xml,${"a".repeat(8_192 - "data:image/svg+xml,".length)}`;
   assert.equal(withinCap.length, 8_192);
+  // An inline SVG avatar within the cap must render (member is valid).
   assert.equal(memberAvatarUrl(withinCap), withinCap);
-  assert.equal(memberAvatarUrl(`${withinCap}a`), null);
+  // One byte over the cap makes the avatar unsafe → member is invalid.
+  assert.deepEqual(
+    memberAvatarUrl(`${withinCap}a`),
+    { invalid: true },
+    "oversized SVG avatar must mark the member invalid",
+  );
 });
 
 test("test_team_coordinates_remain_independent_across_publishers", () => {
@@ -731,5 +757,90 @@ test("test_fixture_invalid_name_pool_not_array_is_rejected", () => {
   assert.ok(
     result.invalidMemberCount >= 1,
     "name_pool non-array must mark the member as invalid",
+  );
+});
+
+test("test_fixture_invalid_name_pool_null_is_rejected", () => {
+  // name_pool: null is not absent — Rust rejects it at deserialization.
+  // TS must also reject it (null != absent; only undefined is absent).
+  const result = parseTeamCatalogContent(
+    fixtureEvent("invalid_name_pool_null.json"),
+  );
+  assert.ok(result !== null, "top-level body is still parseable");
+  assert.ok(
+    result.invalidMemberCount >= 1,
+    "name_pool: null must mark the member as invalid",
+  );
+});
+
+test("test_fixture_invalid_builtin_slug_wrong_type_is_rejected", () => {
+  // builtin_slug: 42 is a present wrong-typed value — must fail rather than
+  // being treated as absent. Both validators agree the member is invalid.
+  const result = parseTeamCatalogContent(
+    fixtureEvent("invalid_builtin_slug_wrong_type.json"),
+  );
+  assert.ok(result !== null, "top-level body is still parseable");
+  assert.ok(
+    result.invalidMemberCount >= 1,
+    "builtin_slug: 42 (wrong type) must mark the member as invalid",
+  );
+});
+
+test("test_fixture_invalid_avatar_url_javascript_is_rejected", () => {
+  // avatar_url: "javascript:alert(1)" passes the byte-length bound but uses
+  // an unsafe scheme. The TS validator must mark the member invalid so Add
+  // is disabled before the backend rejects the same head.
+  const result = parseTeamCatalogContent(
+    fixtureEvent("invalid_avatar_url_javascript.json"),
+  );
+  assert.ok(result !== null, "top-level body is still parseable");
+  assert.ok(
+    result.invalidMemberCount >= 1,
+    "javascript: avatar URL must mark the member as invalid",
+  );
+});
+
+test("test_fixture_valid_avatar_url_https_is_accepted", () => {
+  // A well-formed https:// avatar URL must pass both validators.
+  const result = parseTeamCatalogContent(
+    fixtureEvent("valid_avatar_url_https.json"),
+  );
+  assert.ok(result !== null, "valid_avatar_url_https.json must be accepted");
+  assert.equal(result.invalidMemberCount, 0, "https avatar must be valid");
+});
+
+// ── teamAutoRetractedNotice: backend payload format ───────────────────────
+//
+// The `team-catalog-auto-retracted` Tauri event carries `{ teamName, reason }`.
+// useAgentsDataRefresh builds a toast via teamAutoRetractedNotice, so the
+// payload contract — and the "queued" wording that distinguishes an enqueued
+// tombstone from a relay-confirmed removal — is tested here as a pure-
+// function unit test rather than a React rendering test.
+
+test("test_team_auto_retracted_notice_names_team_and_reason", () => {
+  const msg = teamAutoRetractedNotice(
+    "My Team",
+    "member instructions too large",
+  );
+  assert.ok(msg.includes("My Team"), "notice must name the affected team");
+  assert.ok(
+    msg.includes("member instructions too large"),
+    "notice must include the backend reason",
+  );
+});
+
+test("test_team_auto_retracted_notice_says_queued_not_removed", () => {
+  // The relay head may still be live until the flush loop publishes the
+  // tombstone.  The notice must say "queued for removal" — not "was removed".
+  const msg = teamAutoRetractedNotice("Alpha Team", "team no longer exists");
+  assert.ok(
+    !msg.includes("was removed"),
+    "notice must not claim the team is already gone from the relay",
+  );
+  assert.ok(
+    msg.includes("queued") ||
+      msg.includes("being removed") ||
+      msg.includes("can no longer be projected"),
+    `notice must reflect the pending-tombstone status; got: ${msg}`,
   );
 });

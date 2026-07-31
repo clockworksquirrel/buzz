@@ -35,6 +35,9 @@ use crate::{
 mod apply;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "adopt/tests_coverage.rs"]
+mod tests_coverage;
 
 /// The coordinate the frontend asks to add, before any verification.
 ///

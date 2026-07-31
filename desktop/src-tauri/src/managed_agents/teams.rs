@@ -395,3 +395,84 @@ pub(crate) fn deactivate_catalog_member_copies_with_ref_check(
 #[cfg(test)]
 #[path = "teams_tests.rs"]
 mod tests;
+
+/// Test-only seam for [`delete_team_with_cascade`] that takes explicit file
+/// paths instead of an `AppHandle`. Mirrors the catalog-adopted deletion path
+/// (the only path that uses the byte-rollback boundary) without requiring a
+/// full Tauri runtime.
+///
+/// Only the catalog-adopted path is covered by this seam because that is the
+/// path with the byte-rollback boundary. Directory-backed team deletion
+/// requires filesystem operations that are best left to integration tests.
+#[cfg(test)]
+pub(crate) fn delete_catalog_team_at(
+    personas_path: &std::path::Path,
+    teams_path: &std::path::Path,
+    team_id: &str,
+) -> Result<(), String> {
+    // Read raw JSON without the merge-in-built-ins side effect so the test
+    // stores reflect exactly what delete_team_with_cascade writes (which also
+    // reads via load_teams, not load_teams_readonly, and never writes back
+    // built-ins in the middle of a delete).
+    let personas: Vec<super::AgentDefinition> = if personas_path.exists() {
+        let json = std::fs::read_to_string(personas_path)
+            .map_err(|e| format!("failed to read personas: {e}"))?;
+        serde_json::from_str(&json).map_err(|e| format!("failed to parse personas: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let teams: Vec<TeamRecord> = if teams_path.exists() {
+        let json = std::fs::read_to_string(teams_path)
+            .map_err(|e| format!("failed to read teams: {e}"))?;
+        serde_json::from_str(&json).map_err(|e| format!("failed to parse teams: {e}"))?
+    } else {
+        Vec::new()
+    };
+
+    let team = teams
+        .iter()
+        .find(|t| t.id == team_id)
+        .ok_or_else(|| format!("team {team_id} not found"))?;
+
+    let catalog_source = team
+        .catalog_source
+        .as_ref()
+        .ok_or_else(|| "delete_catalog_team_at only handles catalog-adopted teams".to_string())?
+        .clone();
+
+    let mut personas_mut = personas;
+    let remaining_teams: Vec<&TeamRecord> = teams.iter().filter(|t| t.id != team_id).collect();
+
+    deactivate_catalog_member_copies_with_ref_check(
+        &mut personas_mut,
+        &catalog_source.owner_pubkey,
+        &catalog_source.team_d_tag,
+        &remaining_teams,
+    );
+
+    let new_teams: Vec<TeamRecord> = teams.into_iter().filter(|t| t.id != team_id).collect();
+
+    let personas_snap = super::storage::snapshot_store(personas_path)?;
+    let teams_snap = super::storage::snapshot_store(teams_path)?;
+
+    super::storage::commit_stores_with_snapshots(
+        personas_path,
+        teams_path,
+        personas_snap,
+        teams_snap,
+        || {
+            let json = serde_json::to_vec_pretty(&personas_mut)
+                .map_err(|e| format!("failed to serialize personas: {e}"))?;
+            super::storage::atomic_write_json(personas_path, &json)
+        },
+        || {
+            let mut sorted = new_teams.clone();
+            sort_teams(&mut sorted);
+            let json = serde_json::to_vec_pretty(&sorted)
+                .map_err(|e| format!("failed to serialize teams: {e}"))?;
+            super::storage::atomic_write_json(teams_path, &json)
+        },
+    )?;
+
+    Ok(())
+}

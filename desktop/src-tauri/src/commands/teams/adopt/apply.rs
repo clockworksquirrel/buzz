@@ -316,11 +316,24 @@ fn member_copy(
         // Validated at the boundary rather than copied opaquely: an
         // unrecognized mode from a foreign publisher must not become a local
         // definition whose audience differs from what the recipient sees.
+        // `allowlist` is additionally normalized to `owner-only`: the allowlist
+        // pubkeys are never published (privacy), so adopting `allowlist` with an
+        // empty allowlist would create a persona that fails at mint time. The
+        // recipient can widen from `owner-only` in the edit dialog if desired.
         respond_to: member
             .respond_to
             .as_deref()
-            .map(|mode| RespondTo::parse_wire(mode).map(|_| mode.to_string()))
-            .transpose()?,
+            .map(|mode| -> Result<Option<String>, String> {
+                let parsed =
+                    RespondTo::parse_wire(mode).map_err(|e| format!("invalid respond_to: {e}"))?;
+                if parsed == RespondTo::Allowlist {
+                    Ok(Some(RespondTo::OwnerOnly.as_str().to_string()))
+                } else {
+                    Ok(Some(mode.to_string()))
+                }
+            })
+            .transpose()?
+            .flatten(),
         respond_to_allowlist: Vec::new(),
         parallelism: member.parallelism,
         created_at: now.to_string(),

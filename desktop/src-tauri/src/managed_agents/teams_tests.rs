@@ -634,3 +634,181 @@ fn test_ref_check_deactivates_one_but_preserves_another_in_same_call() {
         "m2 is unreferenced — must be deactivated"
     );
 }
+
+// ── delete_catalog_team_at: production-path delete/persist/reload/re-add ──
+//
+// Tests that exercise the catalog-adopted team deletion path through the
+// `delete_catalog_team_at` seam (which mirrors `delete_team_with_cascade`'s
+// catalog branch without needing a Tauri AppHandle).
+
+fn catalog_persona(id: &str, owner: &str, d_tag: &str) -> AgentDefinition {
+    AgentDefinition {
+        id: id.to_string(),
+        display_name: id.to_string(),
+        avatar_url: None,
+        system_prompt: "Do the work.".to_string(),
+        runtime: None,
+        model: None,
+        provider: None,
+        name_pool: Vec::new(),
+        is_builtin: false,
+        is_active: true,
+        shared: false,
+        source_team: None,
+        source_team_persona_slug: None,
+        catalog_source: None,
+        team_catalog_source: Some(crate::managed_agents::TeamMemberCatalogSource {
+            owner_pubkey: owner.to_string(),
+            team_d_tag: d_tag.to_string(),
+            member_key: id.to_string(),
+            projection_hash: "a".repeat(64),
+        }),
+        env_vars: std::collections::BTreeMap::new(),
+        respond_to: None,
+        respond_to_allowlist: Vec::new(),
+        parallelism: None,
+        created_at: "2026-07-30T00:00:00Z".to_string(),
+        updated_at: "2026-07-30T00:00:00Z".to_string(),
+    }
+}
+
+fn catalog_team(id: &str, owner: &str, d_tag: &str, persona_ids: Vec<String>) -> TeamRecord {
+    TeamRecord {
+        id: id.to_string(),
+        name: id.to_string(),
+        description: None,
+        instructions: None,
+        persona_ids,
+        is_builtin: false,
+        shared: false,
+        catalog_source: Some(crate::managed_agents::TeamCatalogSource {
+            owner_pubkey: owner.to_string(),
+            team_d_tag: d_tag.to_string(),
+        }),
+        source_dir: None,
+        is_symlink: false,
+        symlink_target: None,
+        version: None,
+        created_at: "2026-07-30T00:00:00Z".to_string(),
+        updated_at: "2026-07-30T00:00:00Z".to_string(),
+    }
+}
+
+fn write_stores(base: &std::path::Path, personas: &[AgentDefinition], teams: &[TeamRecord]) {
+    std::fs::write(
+        base.join("personas.json"),
+        serde_json::to_string(personas).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("teams.json"),
+        serde_json::to_string(teams).unwrap(),
+    )
+    .unwrap();
+}
+
+fn read_personas(base: &std::path::Path) -> Vec<AgentDefinition> {
+    let json = std::fs::read_to_string(base.join("personas.json")).unwrap();
+    serde_json::from_str(&json).unwrap()
+}
+
+fn read_teams(base: &std::path::Path) -> Vec<TeamRecord> {
+    let json = std::fs::read_to_string(base.join("teams.json")).unwrap_or_default();
+    serde_json::from_str(&json).unwrap_or_default()
+}
+
+#[test]
+fn test_delete_catalog_team_deactivates_members_and_removes_team() {
+    // Full lifecycle: add a catalog-adopted team with two members, delete it
+    // via delete_catalog_team_at, then reload and verify the team is gone and
+    // the member copies are deactivated.
+    let dir = tempfile::tempdir().unwrap();
+    let owner = "a".repeat(64);
+    let d_tag = "team-alpha";
+
+    let m1 = catalog_persona("m1", &owner, d_tag);
+    let m2 = catalog_persona("m2", &owner, d_tag);
+    let t = catalog_team(
+        "team-abc",
+        &owner,
+        d_tag,
+        vec!["m1".to_string(), "m2".to_string()],
+    );
+    write_stores(dir.path(), &[m1, m2], &[t]);
+
+    let personas_path = dir.path().join("personas.json");
+    let teams_path = dir.path().join("teams.json");
+
+    super::delete_catalog_team_at(&personas_path, &teams_path, "team-abc").unwrap();
+
+    let after_personas = read_personas(dir.path());
+    let after_teams = read_teams(dir.path());
+
+    assert_eq!(after_teams.len(), 0, "team must be removed");
+    assert_eq!(
+        after_personas.len(),
+        2,
+        "copies stay in store but deactivated"
+    );
+    assert!(
+        !after_personas[0].is_active && !after_personas[1].is_active,
+        "all copies must be deactivated"
+    );
+}
+
+#[test]
+fn test_delete_catalog_team_team_save_failure_rolls_back_both_stores() {
+    // When the teams save fails, the byte-rollback must restore both personas
+    // and teams to their pre-delete state. We simulate teams-save failure by
+    // using commit_stores_with_snapshots with an injected failure on the
+    // teams-write callback.
+    use crate::managed_agents::storage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let owner = "c".repeat(64);
+    let d_tag = "team-gamma";
+
+    let m1 = catalog_persona("m1", &owner, d_tag);
+    let t = catalog_team("team-gamma-copy", &owner, d_tag, vec!["m1".to_string()]);
+    let personas_path = dir.path().join("personas.json");
+    let teams_path = dir.path().join("teams.json");
+    write_stores(
+        dir.path(),
+        std::slice::from_ref(&m1),
+        std::slice::from_ref(&t),
+    );
+
+    // Snapshot the original bytes for comparison.
+    let orig_personas_bytes = std::fs::read(&personas_path).unwrap();
+    let orig_teams_bytes = std::fs::read(&teams_path).unwrap();
+
+    // Simulate the delete: personas-write succeeds, teams-write fails.
+    let personas_snap = storage::snapshot_store(&personas_path).unwrap();
+    let teams_snap = storage::snapshot_store(&teams_path).unwrap();
+
+    let mut personas_mut = vec![m1.clone()];
+    personas_mut[0].is_active = false;
+    let personas_bytes = serde_json::to_vec_pretty(&personas_mut).unwrap();
+
+    let result = storage::commit_stores_with_snapshots(
+        &personas_path,
+        &teams_path,
+        personas_snap,
+        teams_snap,
+        || storage::atomic_write_json(&personas_path, &personas_bytes),
+        || Err("simulated teams-write failure".to_string()),
+    );
+
+    assert!(result.is_err(), "write failure must propagate");
+    // Both files must be restored to their original bytes.
+    assert_eq!(
+        std::fs::read(&personas_path).unwrap(),
+        orig_personas_bytes,
+        "personas must be restored to original bytes"
+    );
+    assert_eq!(
+        std::fs::read(&teams_path).unwrap(),
+        orig_teams_bytes,
+        "teams must be restored to original bytes"
+    );
+}

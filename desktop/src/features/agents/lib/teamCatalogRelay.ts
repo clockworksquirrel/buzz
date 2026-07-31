@@ -125,7 +125,8 @@ function memberPassesV1(value: unknown): boolean {
     value.avatar_url !== undefined &&
     value.avatar_url !== null &&
     (typeof value.avatar_url !== "string" ||
-      !withinBytes(value.avatar_url, MAX_AVATAR_URL_BYTES))
+      !withinBytes(value.avatar_url, MAX_AVATAR_URL_BYTES) ||
+      safeCatalogAvatarUrl(value.avatar_url) === null)
   ) {
     return false;
   }
@@ -143,12 +144,11 @@ function memberPassesV1(value: unknown): boolean {
   }
 
   // name_pool: must be an array when present; non-array fails (I8).
-  if (
-    value.name_pool !== undefined &&
-    value.name_pool !== null &&
-    !Array.isArray(value.name_pool)
-  ) {
-    return false;
+  // null is NOT treated as absent — Rust's Vec<String> rejects explicit null.
+  if (value.name_pool !== undefined) {
+    if (value.name_pool === null || !Array.isArray(value.name_pool)) {
+      return false;
+    }
   }
   // name_pool: entry count and per-entry bounds
   if (Array.isArray(value.name_pool)) {
@@ -186,12 +186,20 @@ function memberPassesV1(value: unknown): boolean {
     }
   }
 
-  // Built-in reuse hint: either both present or both absent
+  // Built-in reuse hint: either both present and valid, or both absent.
+  // A present-but-wrong-type value must fail (not be treated as absent).
+  const slugPresent =
+    value.builtin_slug !== undefined && value.builtin_slug !== null;
+  const hashPresent =
+    value.projection_hash !== undefined && value.projection_hash !== null;
   const hasSlug =
     typeof value.builtin_slug === "string" && value.builtin_slug.length > 0;
   const hasHash =
     typeof value.projection_hash === "string" &&
     value.projection_hash.length > 0;
+  // Reject if present but wrong type (e.g., builtin_slug: 42 or projection_hash: {})
+  if (slugPresent && !hasSlug) return false;
+  if (hashPresent && !hasHash) return false;
   if (hasSlug !== hasHash) return false;
   if (hasSlug) {
     if (!withinBytes(value.builtin_slug as string, MAX_BUILTIN_SLUG_BYTES)) {

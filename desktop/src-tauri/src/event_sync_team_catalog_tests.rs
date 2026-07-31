@@ -327,3 +327,110 @@ fn test_deleted_team_tombstone_is_not_repeated_on_next_boot() {
         "no 30178 head remains, so nothing to tombstone"
     );
 }
+
+// ── I2: Multi-head continuation ─────────────────────────────────────────────
+
+fn team_b() -> TeamRecord {
+    TeamRecord {
+        id: "team-beta".to_string(),
+        name: "Beta".to_string(),
+        description: None,
+        instructions: None,
+        persona_ids: vec!["m2".to_string()],
+        is_builtin: false,
+        shared: false,
+        catalog_source: None,
+        source_dir: None,
+        is_symlink: false,
+        symlink_target: None,
+        version: None,
+        created_at: "2026-07-30T00:00:00Z".to_string(),
+        updated_at: "2026-07-30T00:00:00Z".to_string(),
+    }
+}
+
+fn head_for(base_dir: &Path, keys: &nostr::Keys, team_id: &str) -> Option<RetainedEvent> {
+    let conn = open_retention_db(&base_dir.join("retention.db")).unwrap();
+    get_retained_event(
+        &conn,
+        KIND_TEAM_CATALOG,
+        &keys.public_key().to_hex(),
+        team_id,
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_two_unrebuildable_teams_are_both_tombstoned_in_one_reconcile() {
+    // I2: when two shared teams cannot be reprojected, BOTH must be tombstoned
+    // in a single boot reconcile — not just the first one, with the second
+    // waiting for the next boot (the original `drop(conn); return` bug).
+    let base = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+
+    // Share two teams.
+    retain_head(base.path(), &keys, &team(), &[member("m1", "Alpha.")]);
+    retain_head(base.path(), &keys, &team_b(), &[member("m2", "Beta.")]);
+
+    // Both members vanish — both teams are unrebuildable.
+    write_stores(base.path(), &[team(), team_b()], &[]);
+
+    // One reconcile must tombstone both.
+    let count = reconcile(base.path(), &keys).unwrap();
+    assert_eq!(count, 2, "both tombstones must be applied in one pass");
+
+    // Both 30178 heads must be gone.
+    assert!(
+        head_for(base.path(), &keys, TEAM_ID).is_none(),
+        "team-alpha 30178 head must be purged"
+    );
+    assert!(
+        head_for(base.path(), &keys, "team-beta").is_none(),
+        "team-beta 30178 head must be purged"
+    );
+
+    // Both kind:5 tombstones must be queued.
+    let conn = open_retention_db(&base.path().join("retention.db")).unwrap();
+    let pending = crate::managed_agents::retention::get_pending_sync(&conn).unwrap();
+    let tombstones: Vec<_> = pending.iter().filter(|r| r.kind == 5).collect();
+    assert_eq!(
+        tombstones.len(),
+        2,
+        "two kind:5 tombstones must be queued (one per team)"
+    );
+}
+
+#[test]
+fn test_one_valid_one_unrebuildable_team_both_processed() {
+    // Continuation must also work when only one of two teams fails rebuild:
+    // the failed team gets tombstoned, the valid team gets refreshed.
+    let base = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+
+    retain_head(base.path(), &keys, &team(), &[member("m1", "Alpha.")]);
+    retain_head(base.path(), &keys, &team_b(), &[member("m2", "Beta.")]);
+
+    // team-alpha's m1 disappears; team-beta's m2 stays but with a new prompt.
+    write_stores(
+        base.path(),
+        &[team(), team_b()],
+        &[member("m2", "Beta revised.")],
+    );
+
+    let count = reconcile(base.path(), &keys).unwrap();
+    assert_eq!(count, 2, "one tombstone + one refresh = 2 reconciled");
+
+    // team-alpha must be tombstoned.
+    assert!(head_for(base.path(), &keys, TEAM_ID).is_none());
+
+    // team-beta must still have a shared head with the new content.
+    let beta_head = head_for(base.path(), &keys, "team-beta").unwrap();
+    assert!(
+        beta_head.content.contains("Beta revised."),
+        "team-beta must reflect the updated member prompt"
+    );
+    assert!(
+        head_is_shared(&beta_head),
+        "the refreshed team-beta must remain discoverable"
+    );
+}

@@ -301,11 +301,13 @@ fn test_member_count_at_the_limit_is_accepted_and_one_over_is_rejected() {
 }
 
 #[test]
-fn test_oversized_avatar_is_omitted_from_the_projection() {
-    // I7: a built-in avatar that exceeds MAX_AVATAR_URL_BYTES is silently
-    // omitted from the projection rather than causing a build failure. The
-    // team stays publishable; the recipient sees the default avatar instead.
-    let mut one = member("m1", "Avatar Hog");
+fn test_oversized_avatar_on_a_builtin_is_omitted_from_the_projection() {
+    // A built-in avatar that exceeds MAX_AVATAR_URL_BYTES is silently omitted
+    // from the projection — the recipient gets the default avatar instead of
+    // a build failure. Built-ins carry 170–190 KiB inline PNG avatars.
+    let mut one = member("m1", "Builtin Avatar Hog");
+    one.is_builtin = true;
+    one.id = "builtin:fizz".to_string(); // gives builtin_catalog_slug() a non-empty slug
     one.avatar_url = Some("d".repeat(MAX_AVATAR_URL_BYTES + 1));
 
     let content = build_team_catalog_content(&team(), &[one]).unwrap();
@@ -313,14 +315,43 @@ fn test_oversized_avatar_is_omitted_from_the_projection() {
     assert_eq!(content.members.len(), 1);
     assert!(
         content.members[0].avatar_url.is_none(),
-        "oversized avatar must be omitted — not rejected — from the projection"
+        "oversized built-in avatar must be omitted — not rejected — from the projection"
+    );
+}
+
+#[test]
+fn test_oversized_avatar_on_a_non_builtin_fails_the_size_contract() {
+    // A non-built-in persona with an oversized avatar must produce a
+    // deterministic "team too large to share" error so the owner can act on it,
+    // rather than silently publishing a different projection than what they see.
+    let mut one = member("m1", "Avatar Hog");
+    one.avatar_url = Some(format!(
+        "https://example.com/{}",
+        "a".repeat(MAX_AVATAR_URL_BYTES)
+    ));
+
+    let error = build_team_catalog_content(&team(), &[one]).unwrap_err();
+    assert!(
+        error.contains("avatar") || error.contains("too large"),
+        "non-builtin oversized avatar must name the field in the error: {error}"
     );
 }
 
 #[test]
 fn test_avatar_exactly_at_the_limit_is_accepted() {
+    // A safe https:// URL exactly at MAX_AVATAR_URL_BYTES must be accepted.
+    // The URL must pass both the byte bound and the safe-scheme check.
+    let url = format!(
+        "https://example.com/{}",
+        "a".repeat(MAX_AVATAR_URL_BYTES - "https://example.com/".len())
+    );
+    assert_eq!(
+        url.len(),
+        MAX_AVATAR_URL_BYTES,
+        "fixture must be exactly at limit"
+    );
     let mut one = member("m1", "One");
-    one.avatar_url = Some("d".repeat(MAX_AVATAR_URL_BYTES));
+    one.avatar_url = Some(url);
     assert!(build_team_catalog_content(&team(), &[one]).is_ok());
 }
 
@@ -871,5 +902,51 @@ fn test_fixture_invalid_name_pool_not_array_is_rejected() {
     assert!(
         team_catalog_content_from_event(&event).is_err(),
         "invalid_name_pool_not_array.json must be rejected"
+    );
+}
+
+#[test]
+fn test_fixture_invalid_name_pool_null_is_rejected() {
+    // name_pool: null cannot deserialize into Vec<String> — serde rejects it
+    // even with #[serde(default)] because null is not the same as absent.
+    // The TS validator must also reject it (null != absent for a non-optional Vec).
+    let event = signed_event_with_content(fixture!("invalid_name_pool_null.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_err(),
+        "invalid_name_pool_null.json must be rejected"
+    );
+}
+
+#[test]
+fn test_fixture_invalid_builtin_slug_wrong_type_is_rejected() {
+    // builtin_slug: 42 cannot deserialize into Option<String> — serde rejects
+    // the wrong type. The TS validator must also reject it rather than treating
+    // the wrong type as absent (which would allow the broken hint through as "no hint").
+    let event = signed_event_with_content(fixture!("invalid_builtin_slug_wrong_type.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_err(),
+        "invalid_builtin_slug_wrong_type.json must be rejected"
+    );
+}
+
+#[test]
+fn test_fixture_invalid_avatar_url_javascript_is_rejected() {
+    // avatar_url: "javascript:alert(1)" passes the byte-length bound but uses
+    // an unsafe scheme. Both validators must reject it — the Rust reader before
+    // persistence, the TS reader before Add is enabled.
+    let event = signed_event_with_content(fixture!("invalid_avatar_url_javascript.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_err(),
+        "invalid_avatar_url_javascript.json must be rejected"
+    );
+}
+
+#[test]
+fn test_fixture_valid_avatar_url_https_is_accepted() {
+    // A well-formed https:// avatar URL must pass both validators.
+    let event = signed_event_with_content(fixture!("valid_avatar_url_https.json").trim());
+    assert!(
+        team_catalog_content_from_event(&event).is_ok(),
+        "valid_avatar_url_https.json must be accepted"
     );
 }

@@ -10,6 +10,7 @@ import {
   teamsQueryKey,
 } from "@/features/agents/hooks";
 import { managedAgentRuntimesQueryKey } from "@/features/agents/managedAgentRuntimeHooks";
+import { teamAutoRetractedNotice } from "@/features/agents/ui/teamLibraryCopy";
 
 // Trailing-coalesce window: a backfill burst (up to 500 inbound events fed
 // one-by-one through reconcile) fires one `agents-data-changed` per event.
@@ -57,7 +58,7 @@ export function useAgentsDataRefresh(): void {
       reason: string;
     }>("team-catalog-auto-retracted", (event) => {
       toast.warning(
-        `"${event.payload.teamName}" was removed from the community catalog because it can no longer be projected: ${event.payload.reason}`,
+        teamAutoRetractedNotice(event.payload.teamName, event.payload.reason),
       );
       // Invalidate team queries so the share toggle reflects the retraction.
       void queryClient.invalidateQueries({ queryKey: teamsQueryKey });

@@ -460,3 +460,220 @@ fn test_refresh_skips_unshared_retained_head() {
         "unshared head must not be refreshed"
     );
 }
+
+// ── CRITICAL: persona edit must only project team members ──────────────────
+//
+// These tests use `refresh_for_persona_at`, the file-based testable seam for
+// `refresh_shared_team_catalog_heads_for_persona`, to verify that a persona
+// edit never embeds unrelated local personas in the published 30178.
+
+fn write_stores(base_dir: &std::path::Path, teams: &[TeamRecord], personas: &[AgentDefinition]) {
+    std::fs::write(
+        base_dir.join("teams.json"),
+        serde_json::to_string(teams).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        base_dir.join("personas.json"),
+        serde_json::to_string(personas).unwrap(),
+    )
+    .unwrap();
+}
+
+fn team_with_members(id: &str, name: &str, persona_ids: Vec<String>) -> TeamRecord {
+    TeamRecord {
+        id: id.to_string(),
+        name: name.to_string(),
+        description: None,
+        instructions: None,
+        persona_ids,
+        is_builtin: false,
+        shared: false,
+        catalog_source: None,
+        source_dir: None,
+        is_symlink: false,
+        symlink_target: None,
+        version: None,
+        created_at: "2026-07-30T00:00:00Z".to_string(),
+        updated_at: "2026-07-30T00:00:00Z".to_string(),
+    }
+}
+
+#[test]
+fn test_persona_edit_only_projects_team_members_not_the_whole_store() {
+    // CRITICAL: editing persona "m1" must only project m1 and m2 into the
+    // shared 30178 — not "unrelated" (which happens to be in the persona store
+    // but is not a member of the team).
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let owner = keys.public_key().to_hex();
+    let db_path = scoped_db(dir.path(), "wss://a.example", &owner);
+
+    let m1 = member("m1", "Member One.");
+    let m2 = member("m2", "Member Two.");
+    let unrelated = member("unrelated", "SECRET INSTRUCTIONS.");
+
+    let t = team_with_members(
+        "team-abc",
+        "Catalog Team",
+        vec!["m1".to_string(), "m2".to_string()],
+    );
+
+    // Pre-share the team head.
+    prepare_team_publication_at(&db_path, &keys, &t, &[m1.clone(), m2.clone()], Some(true))
+        .unwrap();
+
+    // Write stores: 3 personas (2 team members + 1 unrelated).
+    write_stores(
+        dir.path(),
+        &[t],
+        &[m1.clone(), m2.clone(), unrelated.clone()],
+    );
+
+    // Simulate a persona edit on "m1".
+    super::refresh_for_persona_at(dir.path(), &keys, &db_path, "m1").unwrap();
+
+    // The resulting 30178 must contain m1 and m2 — never "unrelated".
+    let head = retained_head(&db_path, &owner).expect("shared head must still exist");
+    let event = nostr::Event::from_json(&head.raw_event).unwrap();
+    assert!(
+        event_is_shared(&event),
+        "the team must remain discoverable after a member edit"
+    );
+    assert!(
+        head.content.contains("Member One."),
+        "the edited persona's content must be in the 30178"
+    );
+    assert!(
+        head.content.contains("Member Two."),
+        "the other team member must be in the 30178"
+    );
+    assert!(
+        !head.content.contains("SECRET INSTRUCTIONS."),
+        "unrelated personas must NEVER appear in the 30178 projection"
+    );
+}
+
+#[test]
+fn test_persona_edit_does_not_publish_for_never_shared_team() {
+    // A persona that belongs to a never-shared team must produce no 30178
+    // even when the persona is edited and the store has many other personas.
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let owner = keys.public_key().to_hex();
+    let db_path = scoped_db(dir.path(), "wss://a.example", &owner);
+
+    let m1 = member("m1", "Member One.");
+    let t = team_with_members("team-abc", "Catalog Team", vec!["m1".to_string()]);
+
+    // No shared head — the team was never shared.
+    write_stores(dir.path(), &[t], &[m1]);
+
+    super::refresh_for_persona_at(dir.path(), &keys, &db_path, "m1").unwrap();
+
+    assert!(
+        retained_head(&db_path, &owner).is_none(),
+        "persona edit on a never-shared team must not produce a 30178 row"
+    );
+}
+
+#[test]
+fn test_persona_edit_tombstones_when_another_member_is_missing() {
+    // If m2 is deleted from the persona store while the team is still shared,
+    // an edit of m1 must tombstone the shared head rather than publishing a
+    // projection that is missing a team member.
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let owner = keys.public_key().to_hex();
+    let db_path = scoped_db(dir.path(), "wss://a.example", &owner);
+
+    let m1 = member("m1", "Member One.");
+    let m2 = member("m2", "Member Two.");
+    let t = team_with_members(
+        "team-abc",
+        "Catalog Team",
+        vec!["m1".to_string(), "m2".to_string()],
+    );
+
+    // Pre-share with both members.
+    prepare_team_publication_at(&db_path, &keys, &t, &[m1.clone(), m2.clone()], Some(true))
+        .unwrap();
+
+    // m2 is gone from the store — team is now unresolvable.
+    write_stores(dir.path(), &[t], &[m1]);
+
+    super::refresh_for_persona_at(dir.path(), &keys, &db_path, "m1").unwrap();
+
+    // The shared head must be purged (tombstoned).
+    assert!(
+        retained_head(&db_path, &owner).is_none(),
+        "unresolvable team must be tombstoned, not left with stale members"
+    );
+    let conn = open_retention_db(&db_path).unwrap();
+    let pending = get_pending_sync(&conn).unwrap();
+    assert!(
+        pending.iter().any(|r| r.kind == 5),
+        "a kind:5 tombstone must be queued"
+    );
+}
+
+// ── Typed outcome ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_refresh_returns_refreshed_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let owner = keys.public_key().to_hex();
+    let db_path = scoped_db(dir.path(), "wss://a.example", &owner);
+
+    prepare_team_publication_at(&db_path, &keys, &team(), &members(), Some(true)).unwrap();
+
+    let outcome = refresh_or_retract_shared_head_at(&db_path, &keys, &team(), &members()).unwrap();
+
+    assert_eq!(
+        outcome,
+        RefreshOrRetractOutcome::Refreshed,
+        "a successful rebuild must return Refreshed"
+    );
+}
+
+#[test]
+fn test_refresh_returns_noop_for_never_shared_team() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let owner = keys.public_key().to_hex();
+    let db_path = scoped_db(dir.path(), "wss://a.example", &owner);
+
+    // No retained head at all.
+    let outcome = refresh_or_retract_shared_head_at(&db_path, &keys, &team(), &members()).unwrap();
+
+    assert_eq!(
+        outcome,
+        RefreshOrRetractOutcome::Noop,
+        "no retained head must return Noop"
+    );
+    let _ = owner; // suppress unused warning
+}
+
+#[test]
+fn test_refresh_returns_removal_queued_on_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let owner = keys.public_key().to_hex();
+    let db_path = scoped_db(dir.path(), "wss://a.example", &owner);
+
+    prepare_team_publication_at(&db_path, &keys, &team(), &members(), Some(true)).unwrap();
+
+    let mut oversized = member("m1", "One");
+    oversized.system_prompt =
+        "x".repeat(crate::managed_agents::team_catalog::MAX_SYSTEM_PROMPT_BYTES + 1);
+    let bad = vec![oversized, member("m2", "Two")];
+
+    let outcome = refresh_or_retract_shared_head_at(&db_path, &keys, &team(), &bad).unwrap();
+
+    assert!(
+        matches!(outcome, RefreshOrRetractOutcome::RemovalQueued { .. }),
+        "projection failure must return RemovalQueued, got {outcome:?}"
+    );
+    let _ = owner;
+}

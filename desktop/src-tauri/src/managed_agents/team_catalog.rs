@@ -232,11 +232,17 @@ fn member_projection(record: &AgentDefinition) -> TeamCatalogMember {
     // that is the point of the reuse hint. For a fallback copy (hostile hash),
     // omitting the oversized avatar is acceptable for v1: the recipient sees
     // the default avatar. Either way, projecting an oversized avatar would
-    // cause the entire team publication to fail the size contract (I7).
+    // cause the entire team publication to fail the size contract.
+    //
+    // For NON-built-in members, the avatar is NOT silently stripped: an owner
+    // who set a large avatar deserves a deterministic "team too large to share"
+    // error, not a silently-different projection than the one they see locally.
+    // The total-size contract (`MAX_TOTAL_BYTES`) is the backstop.
+    let is_builtin = builtin_catalog_slug(record).is_some();
     let avatar_url = record
         .avatar_url
         .as_deref()
-        .filter(|url| url.len() <= MAX_AVATAR_URL_BYTES)
+        .filter(|url| !is_builtin || url.len() <= MAX_AVATAR_URL_BYTES)
         .map(|url| url.to_string());
 
     TeamCatalogMember {
@@ -320,6 +326,56 @@ pub fn local_member_projection_hash(record: &AgentDefinition) -> String {
     member_projection_hash(&member_projection(record))
 }
 
+/// Validate an avatar URL against the catalog-safe allowlist.
+///
+/// Mirrors `safeCatalogAvatarUrl` in `catalogRelay.ts` — both validators
+/// share the same set of permitted forms so a publisher and a TS-side display
+/// reader agree on what "safe" means:
+///
+/// - `http://` or `https://` URLs (any length within `MAX_AVATAR_URL_BYTES`)
+/// - Inline SVG: `data:image/svg+xml,…` up to 8 192 chars
+/// - Inline raster (png/jpeg/gif/webp): `data:image/<type>;base64,<B64>` up
+///   to 256 KiB with strict base64 shape
+///
+/// A `javascript:` URL, an arbitrary `data:` scheme, or anything else returns
+/// false.
+pub fn is_safe_catalog_avatar_url(url: &str) -> bool {
+    const INLINE_SVG_PREFIX: &str = "data:image/svg+xml,";
+    const MAX_INLINE_SVG_LEN: usize = 8_192;
+    const MAX_INLINE_RASTER_LEN: usize = 256 * 1_024;
+
+    if url.starts_with("https://") || url.starts_with("http://") {
+        return true;
+    }
+    if url.starts_with(INLINE_SVG_PREFIX) {
+        return url.len() <= MAX_INLINE_SVG_LEN;
+    }
+    // Inline raster: data:image/(png|jpeg|gif|webp);base64,<B64>
+    if url.len() <= MAX_INLINE_RASTER_LEN {
+        if let Some(rest) = url.strip_prefix("data:image/") {
+            for mime in &["png", "jpeg", "gif", "webp"] {
+                if let Some(b64_part) = rest
+                    .strip_prefix(mime)
+                    .and_then(|r| r.strip_prefix(";base64,"))
+                {
+                    // Strict base64: only [A-Za-z0-9+/] with up to 2 trailing '='
+                    let trimmed = b64_part.trim_end_matches('=');
+                    let padding = b64_part.len() - trimmed.len();
+                    if padding <= 2
+                        && trimmed
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+                        && b64_part.len() % 4 == 0
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn bounded(value: &str, max: usize, label: &str) -> Result<(), String> {
     if value.len() > max {
         return Err(format!(
@@ -370,6 +426,11 @@ fn validate_member(member: &TeamCatalogMember) -> Result<(), String> {
             MAX_AVATAR_URL_BYTES,
             &format!("the avatar for '{who}'"),
         )?;
+        if !is_safe_catalog_avatar_url(avatar) {
+            return Err(format!(
+                "invalid team projection: the avatar for '{who}' uses an unsafe URL scheme (must be https, http, or an approved inline data URL)"
+            ));
+        }
     }
     for (value, label) in [
         (&member.runtime, "runtime"),
@@ -644,3 +705,6 @@ pub fn tombstone_team_catalog_coordinate(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "team_catalog/tests_coverage.rs"]
+mod tests_coverage;

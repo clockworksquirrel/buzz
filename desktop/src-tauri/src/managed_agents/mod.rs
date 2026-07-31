@@ -79,6 +79,9 @@ pub use storage::*;
 pub use teams::*;
 pub use types::*;
 
+#[cfg(test)]
+pub(crate) use teams::delete_catalog_team_at;
+
 /// Returns the Buzz nest directory (`~/.buzz`) if it exists as a real
 /// directory (not a symlink), falling back to the user's home directory.
 ///
