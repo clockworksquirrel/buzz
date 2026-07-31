@@ -43,18 +43,16 @@ export function TeamShareDialog({
 
   return (
     <SnapshotShareDialog
-      afterLink={
+      beforeExport={
         // Built-in teams have no catalog head to publish — `set_team_shared`
         // rejects them backend-side, so the control is absent rather than
         // present-and-failing.
         team.isBuiltin ? null : (
           <section
-            className="flex min-h-16 w-full items-center gap-3"
+            className="relative flex min-h-16 w-full items-center gap-3 rounded-2xl bg-background px-5 py-4 shadow-2xl"
             data-testid="team-share-catalog"
           >
-            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
-              <BookUser className="h-4 w-4" />
-            </span>
+            <BookUser className="h-4 w-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0 flex-1">
               <h3 className="text-sm font-medium">
                 {teamCatalogCopy.shareTitle}
