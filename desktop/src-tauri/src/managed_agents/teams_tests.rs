@@ -4,8 +4,8 @@
 //! `#[path]`-included from there.
 
 use super::{
-    agents_referencing_team, deactivate_catalog_member_copies, load_teams_readonly, merge_teams,
-    merge_teams_impl, sort_teams, validate_team_deletion, BuiltInTeam,
+    agents_referencing_team, deactivate_catalog_member_copies_with_ref_check, load_teams_readonly,
+    merge_teams, merge_teams_impl, sort_teams, validate_team_deletion, BuiltInTeam,
 };
 use crate::managed_agents::{
     AgentDefinition, ManagedAgentRecord, TeamMemberCatalogSource, TeamRecord,
@@ -444,7 +444,7 @@ fn load_teams_readonly_surfaces_read_error() {
     );
 }
 
-// ── deactivate_catalog_member_copies ─────────────────────────────────────
+// ── deactivate_catalog_member_copies_with_ref_check ──────────────────────────
 
 const OWNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const D_TAG: &str = "my-team";
@@ -492,7 +492,7 @@ fn test_deactivate_catalog_member_copies_deactivates_matching_copies() {
         catalog_copy("m1", OWNER, D_TAG),
         catalog_copy("m2", OWNER, D_TAG),
     ];
-    let changed = deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    let changed = deactivate_catalog_member_copies_with_ref_check(&mut personas, OWNER, D_TAG, &[]);
     assert!(changed);
     assert!(!personas[0].is_active, "m1 should be deactivated");
     assert!(!personas[1].is_active, "m2 should be deactivated");
@@ -502,7 +502,7 @@ fn test_deactivate_catalog_member_copies_deactivates_matching_copies() {
 fn test_deactivate_catalog_member_copies_skips_different_owner() {
     let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let mut personas = vec![catalog_copy("m1", other, D_TAG)];
-    let changed = deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    let changed = deactivate_catalog_member_copies_with_ref_check(&mut personas, OWNER, D_TAG, &[]);
     assert!(!changed, "different owner must not be deactivated");
     assert!(personas[0].is_active);
 }
@@ -510,7 +510,7 @@ fn test_deactivate_catalog_member_copies_skips_different_owner() {
 #[test]
 fn test_deactivate_catalog_member_copies_skips_different_d_tag() {
     let mut personas = vec![catalog_copy("m1", OWNER, "other-team")];
-    let changed = deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    let changed = deactivate_catalog_member_copies_with_ref_check(&mut personas, OWNER, D_TAG, &[]);
     assert!(!changed, "different d-tag must not be deactivated");
     assert!(personas[0].is_active);
 }
@@ -520,7 +520,7 @@ fn test_deactivate_catalog_member_copies_skips_builtins() {
     // Built-in substitutions are local records, not copies — deleting the team
     // must never deactivate them.
     let mut personas = vec![builtin_copy("builtin:fizz")];
-    let changed = deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    let changed = deactivate_catalog_member_copies_with_ref_check(&mut personas, OWNER, D_TAG, &[]);
     assert!(!changed, "built-in should not be deactivated");
     assert!(personas[0].is_active);
 }
@@ -532,7 +532,7 @@ fn test_deactivate_catalog_member_copies_skips_already_inactive() {
         p.is_active = false;
         p
     }];
-    let changed = deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    let changed = deactivate_catalog_member_copies_with_ref_check(&mut personas, OWNER, D_TAG, &[]);
     assert!(
         !changed,
         "already-inactive record should not count as a change"
@@ -547,7 +547,7 @@ fn test_deactivate_catalog_member_copies_is_scoped_per_publication() {
         catalog_copy("m1", OWNER, D_TAG),
         catalog_copy("m2", OWNER, "other-team"),
     ];
-    deactivate_catalog_member_copies(&mut personas, OWNER, D_TAG);
+    deactivate_catalog_member_copies_with_ref_check(&mut personas, OWNER, D_TAG, &[]);
     assert!(
         !personas[0].is_active,
         "m1 (matching) should be deactivated"
@@ -555,5 +555,82 @@ fn test_deactivate_catalog_member_copies_is_scoped_per_publication() {
     assert!(
         personas[1].is_active,
         "m2 (different d-tag) should remain active"
+    );
+}
+
+// ── ref-check-specific behaviour ─────────────────────────────────────────────
+
+#[test]
+fn test_ref_check_preserves_copy_still_referenced_by_another_team() {
+    // m1 is in both D_TAG (being deleted) and "team-two" (remaining).
+    // Only D_TAG is being deleted, so m1 must stay active because team-two
+    // still needs it.
+    let mut personas = vec![catalog_copy("m1", OWNER, D_TAG)];
+    let remaining = team("team-two", "Team Two");
+    let remaining_with_m1: TeamRecord = TeamRecord {
+        persona_ids: vec!["m1".to_string()],
+        ..remaining
+    };
+    let remaining_teams: Vec<&TeamRecord> = vec![&remaining_with_m1];
+
+    let changed = deactivate_catalog_member_copies_with_ref_check(
+        &mut personas,
+        OWNER,
+        D_TAG,
+        &remaining_teams,
+    );
+
+    assert!(!changed, "a referenced copy must not be deactivated");
+    assert!(
+        personas[0].is_active,
+        "m1 is still referenced by team-two and must stay active"
+    );
+}
+
+#[test]
+fn test_ref_check_deactivates_copy_not_referenced_by_any_remaining_team() {
+    // m1 is in D_TAG (being deleted) but not in any remaining team.
+    let mut personas = vec![catalog_copy("m1", OWNER, D_TAG)];
+    let unrelated_remaining = team("team-two", "Team Two");
+    // team-two's persona_ids is empty, so m1 is not referenced.
+    let remaining_teams: Vec<&TeamRecord> = vec![&unrelated_remaining];
+
+    let changed = deactivate_catalog_member_copies_with_ref_check(
+        &mut personas,
+        OWNER,
+        D_TAG,
+        &remaining_teams,
+    );
+
+    assert!(changed, "unreferenced copy must be deactivated");
+    assert!(!personas[0].is_active);
+}
+
+#[test]
+fn test_ref_check_deactivates_one_but_preserves_another_in_same_call() {
+    // m1 is referenced by a remaining team; m2 is not. The function must
+    // deactivate m2 but leave m1 active in a single call.
+    let mut personas = vec![
+        catalog_copy("m1", OWNER, D_TAG),
+        catalog_copy("m2", OWNER, D_TAG),
+    ];
+    let remaining_with_m1: TeamRecord = TeamRecord {
+        persona_ids: vec!["m1".to_string()],
+        ..team("team-two", "Team Two")
+    };
+    let remaining_teams: Vec<&TeamRecord> = vec![&remaining_with_m1];
+
+    let changed = deactivate_catalog_member_copies_with_ref_check(
+        &mut personas,
+        OWNER,
+        D_TAG,
+        &remaining_teams,
+    );
+
+    assert!(changed, "at least one copy was deactivated");
+    assert!(personas[0].is_active, "m1 is referenced — must stay active");
+    assert!(
+        !personas[1].is_active,
+        "m2 is unreferenced — must be deactivated"
     );
 }

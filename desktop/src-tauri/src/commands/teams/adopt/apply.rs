@@ -25,8 +25,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     managed_agents::{
-        atomic_write_json_restricted, load_personas, load_teams, managed_agents_store_path,
-        save_personas, save_teams,
+        load_personas, load_teams, managed_agents_store_path, save_personas, save_teams,
         team_catalog::{
             builtin_catalog_slug, local_member_projection_hash, TeamCatalogContent,
             TeamCatalogMember,
@@ -48,44 +47,27 @@ pub(super) struct AddPlan {
     pub team: TeamRecord,
 }
 
-/// Raw bytes of a file before the add, or `None` if the file did not exist.
-///
-/// Used to restore both stores to their exact pre-add state when either save
-/// fails. Restoring the managed-agents store from bytes is the only way to
-/// undo a reactivation (flipping `is_active` from `false` to `true`) without
-/// re-reading the file and re-applying the mutation in reverse.
-type RawSnapshot = Option<Vec<u8>>;
-
 /// Read the raw bytes of `path`, or `None` if the file does not yet exist.
-fn snapshot(path: &Path) -> Result<RawSnapshot, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("failed to snapshot {}: {e}", path.display())),
-    }
-}
-
-/// Restore `path` from a snapshot taken by [`snapshot`].
 ///
-/// `None` means the file was absent before the add; remove it so the on-disk
-/// state matches. A restore failure is not masked — it is returned alongside
-/// the original cause that triggered the rollback.
-fn restore(path: &Path, snap: RawSnapshot) -> Result<(), String> {
-    match snap {
-        Some(bytes) => atomic_write_json_restricted(path, &bytes),
-        None => std::fs::remove_file(path)
-            .map_err(|e| format!("failed to remove {} during restore: {e}", path.display())),
-    }
-}
+/// Delegates to `managed_agents::storage::snapshot_store`.
+pub(super) use crate::managed_agents::storage::snapshot_store as snapshot;
+
+/// Write both stores with byte-level rollback on failure, using
+/// caller-supplied pre-computed snapshots.
+///
+/// Both restores are attempted independently on failure, so a persona-restore
+/// failure does not prevent the team restore from running. Errors from both
+/// restores are aggregated into the returned message (I5).
+///
+/// Delegates to `managed_agents::storage::commit_stores_with_snapshots`.
+pub(super) use crate::managed_agents::storage::commit_stores_with_snapshots as commit_stores_with_snaps;
 
 /// Write both stores with byte-level rollback on failure.
 ///
-/// Takes the file paths and write callbacks as arguments so the logic is
-/// testable with temporary files and injected-failure writers without needing
-/// a Tauri `AppHandle`.
-///
-/// On any write error: restore both files from the pre-call snapshots. A
-/// restore failure is surfaced alongside the original error, not masked.
+/// Snapshots the files just before the writes. Prefer
+/// [`commit_stores_with_snaps`] when you need to snapshot before a write-on-load
+/// call that precedes the actual writes.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn commit_stores(
     personas_path: &Path,
     teams_path: &Path,
@@ -94,19 +76,14 @@ pub(super) fn commit_stores(
 ) -> Result<(), String> {
     let personas_snap = snapshot(personas_path)?;
     let teams_snap = snapshot(teams_path)?;
-
-    if let Err(error) = write_personas().and_then(|()| write_teams()) {
-        let restore_result =
-            restore(personas_path, personas_snap).and_then(|()| restore(teams_path, teams_snap));
-        if let Err(restore_error) = restore_result {
-            return Err(format!(
-                "{error} (and the local stores could not be restored: {restore_error})"
-            ));
-        }
-        return Err(error);
-    }
-
-    Ok(())
+    commit_stores_with_snaps(
+        personas_path,
+        teams_path,
+        personas_snap,
+        teams_snap,
+        write_personas,
+        write_teams,
+    )
 }
 
 pub(super) fn add_verified_team(
@@ -126,6 +103,13 @@ pub(super) fn add_verified_team(
     let personas_path = managed_agents_store_path(app)?;
     let teams_path = teams_store_path(app)?;
 
+    // Snapshot raw bytes BEFORE any load: load_personas() can write merged
+    // built-ins on first call (write-on-load effect). Snapshotting after that
+    // write would capture post-merge bytes as "before", so a rollback would
+    // restore the wrong content (I5).
+    let personas_snap = snapshot(&personas_path)?;
+    let teams_snap = snapshot(&teams_path)?;
+
     let personas_before = load_personas(app)?;
     let teams_before = load_teams(app)?;
     let plan = plan_add(&personas_before, &teams_before, source, content, &now_iso())?;
@@ -137,13 +121,14 @@ pub(super) fn add_verified_team(
         });
     };
 
-    // Snapshot raw bytes before either write. If either save fails, we restore
-    // both files to exactly their pre-add state. Using raw bytes rather than
-    // re-serializing the before-vectors ensures the restore is byte-exact even
-    // for a reactivated member copy whose logical undo is a field revert.
-    commit_stores(
+    // Write both stores with byte-level rollback on failure. Snapshots were
+    // taken before any load effect, so the restore is byte-exact even for a
+    // reactivated member copy whose logical undo is a field revert.
+    commit_stores_with_snaps(
         &personas_path,
         &teams_path,
+        personas_snap,
+        teams_snap,
         || save_personas(app, &personas),
         || save_teams(app, &teams),
     )?;

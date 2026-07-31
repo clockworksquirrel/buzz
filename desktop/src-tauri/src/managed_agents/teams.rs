@@ -299,19 +299,53 @@ pub fn delete_team_with_cascade(app: &AppHandle, team_id: &str) -> Result<Vec<St
         }
     } else if let Some(catalog_source) = &team.catalog_source.clone() {
         // Catalog-adopted team: deactivate member copies whose provenance
-        // matches this publication. Built-in reuse substitutions (`is_builtin`)
-        // are never copies and must not be touched. Deactivation rather than
-        // deletion lets re-adding the same publication reactivate them rather
-        // than minting fresh copies with new IDs.
+        // matches this publication AND that no other remaining team still
+        // references (reference preservation — I6). Commit persona deactivation
+        // and team removal through the same byte-rollback boundary so a
+        // team-save failure cannot leave copies inactive while the team record
+        // survives.
         let mut personas = super::load_personas(app)?;
-        let changed = deactivate_catalog_member_copies(
+
+        // The remaining teams AFTER this one is removed — used to check if
+        // any copy is still referenced before deactivating it.
+        let remaining_teams: Vec<_> = teams.iter().filter(|t| t.id != team_id).collect();
+
+        let changed = deactivate_catalog_member_copies_with_ref_check(
             &mut personas,
             &catalog_source.owner_pubkey,
             &catalog_source.team_d_tag,
+            &remaining_teams,
         );
-        if changed {
-            super::save_personas(app, &personas)?;
-        }
+
+        // Remove the team record from the working slice; save both atomically.
+        teams.retain(|record| record.id != team_id);
+
+        let personas_path = super::managed_agents_store_path(app)?;
+        let teams_path = teams_store_path(app)?;
+        let personas_to_write = personas.clone();
+        let teams_to_write = teams.clone();
+
+        // Byte-snapshot both stores before writing, so a save failure rolls
+        // back both (same policy as catalog adoption — I6). Reuse the same
+        // commit primitive so rollback behaviour is identical in both paths.
+        let personas_snap = crate::managed_agents::storage::snapshot_store(&personas_path)?;
+        let teams_snap = crate::managed_agents::storage::snapshot_store(&teams_path)?;
+
+        crate::managed_agents::storage::commit_stores_with_snapshots(
+            &personas_path,
+            &teams_path,
+            personas_snap,
+            teams_snap,
+            || {
+                if changed {
+                    super::save_personas(app, &personas_to_write)?;
+                }
+                Ok(())
+            },
+            || save_teams(app, &teams_to_write),
+        )?;
+
+        return Ok(cascaded_persona_d_tags);
     }
 
     // Remove TeamRecord
@@ -320,14 +354,19 @@ pub fn delete_team_with_cascade(app: &AppHandle, team_id: &str) -> Result<Vec<St
     Ok(cascaded_persona_d_tags)
 }
 
-/// Deactivate all non-built-in personas whose `team_catalog_source` matches
-/// `(owner_pubkey, team_d_tag)`. Returns `true` when any record was changed.
+/// Deactivate non-built-in personas whose provenance matches
+/// `(owner_pubkey, team_d_tag)` AND that are not referenced by any of the
+/// remaining teams.
 ///
-/// Extracted so the deactivation logic is testable without an AppHandle.
-pub(crate) fn deactivate_catalog_member_copies(
+/// A persona copy is "referenced" when it appears in `remaining_team.persona_ids`.
+/// Keeping a referenced copy active prevents breaking a team that shares the
+/// same persona from a different (still-present) catalog addition. Returns
+/// `true` when any record was changed.
+pub(crate) fn deactivate_catalog_member_copies_with_ref_check(
     personas: &mut [super::AgentDefinition],
     owner_pubkey: &str,
     team_d_tag: &str,
+    remaining_teams: &[&super::TeamRecord],
 ) -> bool {
     let mut changed = false;
     for persona in personas.iter_mut() {
@@ -338,7 +377,14 @@ pub(crate) fn deactivate_catalog_member_copies(
             .team_catalog_source
             .as_ref()
             .is_some_and(|s| s.owner_pubkey == owner_pubkey && s.team_d_tag == team_d_tag);
-        if is_copy && persona.is_active {
+        if !is_copy || !persona.is_active {
+            continue;
+        }
+        // Skip copies still referenced by another remaining team.
+        let still_referenced = remaining_teams
+            .iter()
+            .any(|t| t.persona_ids.iter().any(|id| id == &persona.id));
+        if !still_referenced {
             persona.is_active = false;
             changed = true;
         }

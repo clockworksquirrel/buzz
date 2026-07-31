@@ -723,7 +723,7 @@ fn test_delete_then_re_add_reactivates_copies() {
     // delete_team_with_cascade does for catalog-adopted teams), then re-add the
     // same publication. The re-add must reuse and reactivate the existing copies
     // rather than minting duplicates.
-    use crate::managed_agents::deactivate_catalog_member_copies;
+    use crate::managed_agents::deactivate_catalog_member_copies_with_ref_check;
 
     let owner = "a".repeat(64);
     let src = source(&owner);
@@ -737,7 +737,8 @@ fn test_delete_then_re_add_reactivates_copies() {
     let copy_id = personas[0].id.clone();
 
     // Step 2: simulate delete — deactivate the member copies and remove the team
-    let changed = deactivate_catalog_member_copies(&mut personas, &owner, TEAM_D_TAG);
+    let changed =
+        deactivate_catalog_member_copies_with_ref_check(&mut personas, &owner, TEAM_D_TAG, &[]);
     assert!(changed, "deactivation must report a change");
     assert!(!personas[0].is_active, "copy is deactivated after delete");
     teams.clear();
@@ -905,5 +906,93 @@ mod commit_stores_tests {
             msg.contains("could not be restored"),
             "missing restore-failure note in: {msg}"
         );
+    }
+
+    #[test]
+    fn test_second_position_restore_failure_reported() {
+        // When the second restore (teams) fails, the error must be reported
+        // alongside the original write failure — even if personas restored ok.
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let personas = sub.join("personas.json");
+        let teams = sub.join("teams.json");
+        write_file(&personas, b"snap-p");
+        write_file(&teams, b"snap-t");
+
+        // Obliterate the directory after the callbacks for personas succeed
+        // and teams fail.  The personas restore will also fail after the dir
+        // is gone, but we want to verify teams' failure is also reported.
+        let sub_clone = sub.clone();
+        let result = commit_stores(
+            &personas,
+            &teams,
+            || {
+                // personas write succeeds.
+                fs::write(&personas, b"new-personas").map_err(|e| e.to_string())?;
+                Ok(())
+            },
+            || {
+                // teams write obliterates the directory and fails.
+                let _ = std::fs::remove_dir_all(&sub_clone);
+                Err("teams save failed".to_string())
+            },
+        );
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("teams save failed"),
+            "original teams error missing in: {msg}"
+        );
+        assert!(
+            msg.contains("could not be restored"),
+            "restore-failure note missing in: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_absent_snap_restore_is_noop_and_both_restores_are_independent() {
+        // Part A — absent snap: when no file existed before the add and the
+        // write fails, removing a non-existent path is treated as success
+        // (desired state already reached, I5). No "could not be restored" noise.
+        let dir = tempfile::tempdir().unwrap();
+        let personas = dir.path().join("personas.json");
+        let teams = dir.path().join("teams.json");
+        let r = commit_stores(
+            &personas,
+            &teams,
+            || Err("write failed".to_string()),
+            || unreachable!(),
+        );
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.contains("write failed"));
+        assert!(!msg.contains("could not be restored"), "{msg}");
+        assert!(!personas.exists() && !teams.exists());
+
+        // Part B — independent restores: personas restore fails (dir gone after
+        // the first write), teams restore is a no-op (absent snap → NotFound).
+        // Both failures aggregated in the returned error (I5).
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let personas2 = sub.join("personas.json");
+        let teams2 = sub.join("teams.json");
+        write_file(&personas2, b"snap-p");
+        let sub_clone = sub.clone();
+        let r2 = commit_stores(
+            &personas2,
+            &teams2,
+            || {
+                fs::write(&personas2, b"new-p").map_err(|e| e.to_string())?;
+                let _ = std::fs::remove_dir_all(&sub_clone);
+                Ok(())
+            },
+            || Err("teams write failed".to_string()),
+        );
+        assert!(r2.is_err());
+        let msg2 = r2.unwrap_err();
+        assert!(msg2.contains("teams write failed"), "{msg2}");
+        assert!(msg2.contains("could not be restored"), "{msg2}");
     }
 }
