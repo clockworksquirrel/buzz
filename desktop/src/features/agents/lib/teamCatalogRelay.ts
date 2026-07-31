@@ -37,7 +37,7 @@ const MAX_IDENTIFIER_BYTES = 256;
 const MAX_BUILTIN_SLUG_BYTES = 128;
 
 /** Recognized respond_to wire values. Must stay in sync with RespondTo::parse_wire. */
-const RESPOND_TO_VALUES = new Set(["all", "anyone", "allowlist", "owner_only"]);
+const RESPOND_TO_VALUES = new Set(["owner-only", "allowlist", "anyone"]);
 
 function byteLength(value: string): number {
   return new TextEncoder().encode(value).length;
@@ -111,28 +111,45 @@ function memberPassesV1(value: unknown): boolean {
     return false;
   }
 
-  // Optional bounded fields
+  // Optional bounded fields — reject any present wrong-typed value (I8).
+  // A present non-string must fail validation, not be ignored.
   if (
-    typeof value.system_prompt === "string" &&
-    !withinBytes(value.system_prompt, MAX_SYSTEM_PROMPT_BYTES)
+    value.system_prompt !== undefined &&
+    value.system_prompt !== null &&
+    (typeof value.system_prompt !== "string" ||
+      !withinBytes(value.system_prompt, MAX_SYSTEM_PROMPT_BYTES))
   ) {
     return false;
   }
   if (
-    typeof value.avatar_url === "string" &&
-    !withinBytes(value.avatar_url, MAX_AVATAR_URL_BYTES)
+    value.avatar_url !== undefined &&
+    value.avatar_url !== null &&
+    (typeof value.avatar_url !== "string" ||
+      !withinBytes(value.avatar_url, MAX_AVATAR_URL_BYTES))
   ) {
     return false;
   }
   for (const field of ["runtime", "model", "provider"] as const) {
     const v = value[field];
-    if (typeof v === "string") {
-      if (v.trim().length === 0 || !withinBytes(v, MAX_IDENTIFIER_BYTES)) {
+    if (v !== undefined && v !== null) {
+      if (
+        typeof v !== "string" ||
+        v.trim().length === 0 ||
+        !withinBytes(v, MAX_IDENTIFIER_BYTES)
+      ) {
         return false;
       }
     }
   }
 
+  // name_pool: must be an array when present; non-array fails (I8).
+  if (
+    value.name_pool !== undefined &&
+    value.name_pool !== null &&
+    !Array.isArray(value.name_pool)
+  ) {
+    return false;
+  }
   // name_pool: entry count and per-entry bounds
   if (Array.isArray(value.name_pool)) {
     if (value.name_pool.length > MAX_NAME_POOL_ENTRIES) return false;
@@ -180,8 +197,9 @@ function memberPassesV1(value: unknown): boolean {
     if (!withinBytes(value.builtin_slug as string, MAX_BUILTIN_SLUG_BYTES)) {
       return false;
     }
-    // projection_hash must be a 64-char hex digest
-    if (!/^[0-9a-f]{64}$/.test(value.projection_hash as string)) {
+    // projection_hash must be a 64-char hex digest (case-insensitive, aligning
+    // with the Rust validator which uses is_ascii_hexdigit() — I8).
+    if (!/^[0-9a-fA-F]{64}$/.test(value.projection_hash as string)) {
       return false;
     }
   }
@@ -250,16 +268,20 @@ export function parseTeamCatalogContent(
     return null;
   }
 
-  // Team-level text bounds
+  // Team-level text bounds — reject present wrong-typed values (I8).
   if (
-    typeof parsed.description === "string" &&
-    !withinBytes(parsed.description, MAX_TEXT_BYTES)
+    parsed.description !== undefined &&
+    parsed.description !== null &&
+    (typeof parsed.description !== "string" ||
+      !withinBytes(parsed.description, MAX_TEXT_BYTES))
   ) {
     return null;
   }
   if (
-    typeof parsed.instructions === "string" &&
-    !withinBytes(parsed.instructions, MAX_TEXT_BYTES)
+    parsed.instructions !== undefined &&
+    parsed.instructions !== null &&
+    (typeof parsed.instructions !== "string" ||
+      !withinBytes(parsed.instructions, MAX_TEXT_BYTES))
   ) {
     return null;
   }
@@ -277,7 +299,19 @@ export function parseTeamCatalogContent(
   // Parse display-layer fields; track members that fail v1 validation
   const members: CatalogTeamMember[] = [];
   let invalidMemberCount = 0;
+  const seenMemberKeys = new Set<string>();
   for (const candidate of parsed.members) {
+    // Check for duplicate member_key before other validation — a duplicate
+    // is always invalid regardless of the member's other fields (I8).
+    if (
+      typeof (candidate as Record<string, unknown>)?.member_key === "string" &&
+      seenMemberKeys.has(
+        (candidate as Record<string, unknown>).member_key as string,
+      )
+    ) {
+      invalidMemberCount++;
+      continue;
+    }
     if (!memberPassesV1(candidate)) {
       invalidMemberCount++;
       continue; // include the invalid count but still render the valid members
@@ -289,6 +323,7 @@ export function parseTeamCatalogContent(
       invalidMemberCount++;
       continue;
     }
+    seenMemberKeys.add(member.memberKey);
     members.push(member);
   }
 

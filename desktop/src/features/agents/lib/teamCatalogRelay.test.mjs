@@ -488,7 +488,7 @@ test("test_member_with_unrecognized_respond_to_counts_as_invalid", () => {
 });
 
 test("test_recognized_respond_to_values_are_valid", () => {
-  for (const mode of ["all", "anyone", "allowlist", "owner_only"]) {
+  for (const mode of ["owner-only", "anyone", "allowlist"]) {
     const r = parseTeamCatalogContent(
       contentEvent(validBody({ respond_to: mode })),
     );
@@ -586,5 +586,150 @@ test("test_share_disclosure_names_member_instructions", () => {
   assert.ok(
     teamCatalogCopy.shareDescription.toLowerCase().includes("instructions"),
     "disclosure must explicitly say instructions are shared",
+  );
+});
+
+// ── Shared JSON fixture matrix (I8) ──────────────────────────────────────────
+// These fixtures are the canonical source of truth shared with the Rust test
+// suite.  Any divergence surfaces as a failing test in CI on the side that
+// disagrees.
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const FIXTURES = path.join(
+  __dirname,
+  "../../../../src-tauri/tests/fixtures/team_catalog_content",
+);
+
+function fixtureEvent(name) {
+  const content = readFileSync(path.join(FIXTURES, name), "utf8").trim();
+  return {
+    id: "evt-fixture",
+    pubkey: ALICE,
+    created_at: 1,
+    kind: 30178,
+    tags: [
+      ["d", "squad"],
+      ["shared", "true"],
+    ],
+    content,
+    sig: "sig",
+  };
+}
+
+// Valid fixtures
+
+test("test_fixture_valid_minimal_is_accepted", () => {
+  assert.ok(
+    parseTeamCatalogContent(fixtureEvent("valid_minimal.json")) !== null,
+    "valid_minimal.json must be accepted",
+  );
+});
+
+test("test_fixture_valid_respond_to_owner_only_is_accepted", () => {
+  assert.ok(
+    parseTeamCatalogContent(
+      fixtureEvent("valid_respond_to_owner_only.json"),
+    ) !== null,
+    "valid_respond_to_owner_only.json must be accepted",
+  );
+});
+
+test("test_fixture_valid_respond_to_allowlist_is_accepted", () => {
+  assert.ok(
+    parseTeamCatalogContent(fixtureEvent("valid_respond_to_allowlist.json")) !==
+      null,
+    "valid_respond_to_allowlist.json must be accepted",
+  );
+});
+
+test("test_fixture_valid_respond_to_anyone_is_accepted", () => {
+  assert.ok(
+    parseTeamCatalogContent(fixtureEvent("valid_respond_to_anyone.json")) !==
+      null,
+    "valid_respond_to_anyone.json must be accepted",
+  );
+});
+
+test("test_fixture_valid_uppercase_hash_is_accepted", () => {
+  // The Rust validator accepts uppercase hex; the TS validator must also accept
+  // it so the hash-case acceptance is aligned (I8).
+  const result = parseTeamCatalogContent(
+    fixtureEvent("valid_uppercase_hash.json"),
+  );
+  assert.ok(result !== null, "valid_uppercase_hash.json must be accepted");
+});
+
+// Invalid fixtures
+
+test("test_fixture_invalid_respond_to_pascal_case_is_rejected", () => {
+  // The wire protocol uses kebab-case; "OwnerOnly" is the pre-fix TS value.
+  // Both validators reject it, but with different granularity: Rust rejects
+  // the whole body; TS marks the member invalid and increments invalidMemberCount.
+  const result = parseTeamCatalogContent(
+    fixtureEvent("invalid_respond_to_pascal_case.json"),
+  );
+  assert.ok(result !== null, "body with one invalid member is still parseable");
+  assert.ok(
+    result.invalidMemberCount >= 1,
+    "PascalCase respond_to must mark the member invalid",
+  );
+});
+
+test("test_fixture_invalid_description_wrong_type_is_rejected", () => {
+  assert.equal(
+    parseTeamCatalogContent(
+      fixtureEvent("invalid_description_wrong_type.json"),
+    ),
+    null,
+    "invalid_description_wrong_type.json must be rejected",
+  );
+});
+
+test("test_fixture_invalid_instructions_wrong_type_is_rejected", () => {
+  assert.equal(
+    parseTeamCatalogContent(
+      fixtureEvent("invalid_instructions_wrong_type.json"),
+    ),
+    null,
+    "invalid_instructions_wrong_type.json must be rejected",
+  );
+});
+
+test("test_fixture_invalid_duplicate_member_key_is_rejected", () => {
+  // Two members sharing a member_key must cause both validators to reject
+  // the body entirely.  The TS side counts the duplicate as invalid;
+  // since there is no valid member left in a 2-member body with one valid
+  // and one duplicate, the function still returns a non-null result with
+  // invalidMemberCount = 1.  Use strictEqual on invalidMemberCount > 0.
+  const result = parseTeamCatalogContent(
+    fixtureEvent("invalid_duplicate_member_key.json"),
+  );
+  assert.ok(
+    result !== null,
+    "body with one unique + one duplicate key is parseable",
+  );
+  assert.ok(
+    result.invalidMemberCount >= 1,
+    "the duplicate member must increment invalidMemberCount",
+  );
+});
+
+test("test_fixture_invalid_name_pool_not_array_is_rejected", () => {
+  // name_pool must be an array when present; a bare string fails memberPassesV1
+  // and increments invalidMemberCount.  The TS validator routes wrong-typed
+  // member fields through invalidMemberCount (display-layer behavior); the
+  // Rust validator rejects the whole body at deserialization time.  Both agree
+  // the member is invalid; only the granularity of rejection differs.
+  const result = parseTeamCatalogContent(
+    fixtureEvent("invalid_name_pool_not_array.json"),
+  );
+  assert.ok(result !== null, "top-level body is still parseable");
+  assert.ok(
+    result.invalidMemberCount >= 1,
+    "name_pool non-array must mark the member as invalid",
   );
 });
